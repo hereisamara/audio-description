@@ -1,0 +1,6 @@
+# Install a CUDA-compatible torch build using the Lanta module/CUDA version first.
+accelerate>=1.2,<2
+pillow>=10,<13
+qwen-vl-utils>=0.0.8,<1
+transformers>=4.49,<5
+

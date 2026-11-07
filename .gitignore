@@ -1,0 +1,65 @@
+# Python environments and caches
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local inputs, generated outputs, and pipeline work directories
+input/
+inputs/
+output/
+outputs/
+work/
+artifacts/
+tmp/
+
+# Video, audio, extracted frames, and subtitle artifacts
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.ogv
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.aiff
+*.flac
+*.jpg
+*.jpeg
+*.png
+*.vtt
+*.srt
+
+# Model checkpoints and caches
+models/
+checkpoints/
+.cache/
+huggingface/
+*.safetensors
+*.onnx
+*.onnx.json
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Cluster and editor files
+slurm-*.out
+slurm-*.err
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
