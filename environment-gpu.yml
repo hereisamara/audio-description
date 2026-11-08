@@ -1,0 +1,19 @@
+name: offline-ad-gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.2
+  - pytorch-cuda=12.1
+  - transformers>=4.49,<5
+  - accelerate>=1.2,<2
+  - safetensors
+  - sentencepiece
+  - pillow>=10,<13
+  - numpy>=1.26,<3
+  - opencv>=4.10,<5
+  - ffmpeg>=6,<8
+

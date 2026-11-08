@@ -2,7 +2,8 @@
 
 This repository is the first offline proof of concept for generating a
 selectable audio-description track from a real video scene. It supports CPU
-and CUDA execution and makes no external API calls.
+and CUDA execution, uses Conda for all software dependencies, and makes no
+external API calls.
 
 Large inputs, generated videos, extracted frames, audio, model checkpoints,
 and work directories are intentionally excluded from Git. Upload those
@@ -13,13 +14,13 @@ directly to Lanta storage instead.
 ```text
 real input video
   -> FFmpeg media inspection and analysis audio
-  -> faster-whisper word timestamps
+  -> local Whisper word timestamps (Conda-native Transformers backend)
   -> speech-safe narration gaps
-  -> PySceneDetect shots
+  -> OpenCV content-difference shots
   -> lightweight visual/audio/transcript scene grouping
   -> local visual backend: heuristic or Qwen2.5-VL
   -> AD or WAIT decision
-  -> offline Piper/espeak TTS
+  -> local Transformers VITS TTS
   -> FFmpeg soundtrack ducking and mixing
   -> MP4 with original and audio-description tracks
 ```
@@ -35,31 +36,46 @@ offline_ad_poc/
   pipeline.py
   prepare_real_scene.py
 scripts/
+  create_conda_env.sh
   run_lanta.sh
 tests/
   test_pipeline.py
-requirements-core.txt
-requirements-vlm.txt
+environment-cpu.yml
+environment-gpu.yml
 ```
 
 No input or output video is stored in this repository.
 
-## 1. Create the environment
+## 1. Create a Conda environment
 
-Use Python 3.10 or 3.11.
+No `venv` or `pip` command is required. From the repository root, create one
+of the supplied environments.
+
+CPU environment:
 
 ```bash
-python -m venv .venv-lanta
-source .venv-lanta/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-core.txt
+bash scripts/create_conda_env.sh cpu
+conda activate offline-ad-cpu
 ```
 
-For local VLM inference, install a CUDA-compatible PyTorch build for the CUDA
-module available in the job, then run:
+GPU environment:
 
 ```bash
-python -m pip install -r requirements-vlm.txt
+bash scripts/create_conda_env.sh gpu
+conda activate offline-ad-gpu
+```
+
+The GPU file uses `pytorch-cuda=12.1`. The cluster's NVIDIA driver must be
+new enough for that runtime; no system CUDA toolkit is required inside the
+environment. If Lanta requires a different approved CUDA runtime, change only
+that version in `environment-gpu.yml` before creating the environment.
+
+Verify the environment:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+ffmpeg -version
+python -m unittest discover -s tests -v
 ```
 
 ## 2. Stage offline assets on Lanta
@@ -68,13 +84,16 @@ Upload these separately from Git:
 
 ```text
 /path/to/input.mp4
-/path/to/faster-whisper-small.en/
+/path/to/whisper-small.en-transformers/
 /path/to/Qwen2.5-VL-3B-Instruct/
-/path/to/piper-voice.onnx
-/path/to/piper-voice.onnx.json
+/path/to/mms-tts-eng/
 ```
 
-Model downloading is disabled by default during pipeline execution.
+The Whisper and TTS directories must be Hugging Face Transformers-format
+checkpoints, not CTranslate2 conversions. The Qwen directory is only needed
+for the GPU semantic-description run. A compatible TTS checkpoint is
+`facebook/mms-tts-eng`, staged locally before the offline job. Model downloading
+is disabled by default during pipeline execution.
 
 ## 3. Optional real-scene preparation
 
@@ -99,10 +118,11 @@ bash scripts/run_lanta.sh \
   outputs/real-scene-01-cpu.mp4 \
   outputs/real-scene-01-cpu-work \
   --device cpu \
-  --asr-model /models/faster-whisper-small.en \
+  --asr-backend transformers \
+  --asr-model /models/whisper-small.en-transformers \
   --visual-backend heuristic \
-  --tts-backend piper \
-  --piper-model /models/piper/en_US-voice-medium.onnx \
+  --tts-backend transformers \
+  --tts-model /models/mms-tts-eng \
   --maximum-gaps 6
 ```
 
@@ -114,11 +134,12 @@ bash scripts/run_lanta.sh \
   outputs/real-scene-01-qwen.mp4 \
   outputs/real-scene-01-qwen-work \
   --device auto \
-  --asr-model /models/faster-whisper-small.en \
+  --asr-backend transformers \
+  --asr-model /models/whisper-small.en-transformers \
   --visual-backend qwen25 \
   --vlm-model /models/Qwen2.5-VL-3B-Instruct \
-  --tts-backend piper \
-  --piper-model /models/piper/en_US-voice-medium.onnx \
+  --tts-backend transformers \
+  --tts-model /models/mms-tts-eng \
   --maximum-gaps 12
 ```
 
@@ -143,7 +164,9 @@ decision, narration, WebVTT, and evaluation files.
 
 ## Current limitations
 
-- Qwen and Piper paths are implemented but still need validation on Lanta.
+- The Conda Transformers Whisper, Qwen, and VITS paths still need validation on Lanta.
+- Piper and system speech tools remain optional, but the strict Conda-only
+  examples use a locally staged Transformers VITS model.
 - The heuristic backend is for plumbing only.
 - Scene segmentation is a lightweight baseline, not EARS4SEE reproduction.
 - Character recognition and object tracking are not implemented yet.

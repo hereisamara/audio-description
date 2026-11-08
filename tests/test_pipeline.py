@@ -10,6 +10,7 @@ from offline_ad_poc.pipeline import (
     Interval,
     Shot,
     Word,
+    _segments_from_words,
     build_gaps,
     limit_words,
     merge_intervals,
@@ -53,6 +54,12 @@ class PipelineUnitTests(unittest.TestCase):
     def test_merge_intervals_keeps_distant_regions_separate(self) -> None:
         merged = merge_intervals([Interval(0, 1), Interval(1.2, 2), Interval(4, 5)], maximum_gap=0.3)
         self.assertEqual(len(merged), 2)
+
+    def test_transformers_words_are_grouped_into_segments(self) -> None:
+        words = [Word(0.0, 0.3, "hello"), Word(0.4, 0.8, "there"), Word(2.0, 2.3, "again")]
+        segments = _segments_from_words(words)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].text, "hello there")
 
 
 if __name__ == "__main__":

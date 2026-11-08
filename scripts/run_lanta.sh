@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "No Conda environment is active. Activate offline-ad-cpu or offline-ad-gpu first." >&2
+  exit 1
+fi
+
 if [[ $# -lt 3 ]]; then
   echo "Usage: $0 INPUT_VIDEO OUTPUT_VIDEO WORK_DIR [additional pipeline arguments]" >&2
   exit 2

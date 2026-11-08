@@ -119,24 +119,10 @@ def resolve_ffmpeg_tools() -> tuple[str, str]:
     ffprobe = os.environ.get("FFPROBE_BINARY") or shutil.which("ffprobe")
     if ffmpeg and ffprobe:
         return ffmpeg, ffprobe
-    try:
-        from static_ffmpeg import run as static_run
-
-        static_ffmpeg, static_ffprobe = static_run.get_or_fetch_platform_executables_else_raise()
-        return ffmpeg or static_ffmpeg, ffprobe or static_ffprobe
-    except Exception:
-        pass
-    try:
-        import imageio_ffmpeg
-
-        ffmpeg = ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-    if not ffmpeg or not ffprobe:
-        raise RuntimeError(
-            "FFmpeg/ffprobe not found. Install FFmpeg or set FFMPEG_BINARY and FFPROBE_BINARY."
-        )
-    return ffmpeg, ffprobe
+    raise RuntimeError(
+        "FFmpeg/ffprobe not found. Install the Conda ffmpeg package or set "
+        "FFMPEG_BINARY and FFPROBE_BINARY."
+    )
 
 
 def parse_fraction(value: str | None) -> float:
@@ -197,26 +183,45 @@ def extract_analysis_audio(input_video: Path, output_wav: Path, ffmpeg: str) -> 
 
 
 def choose_device(requested: str) -> str:
-    if requested != "auto":
-        return requested
+    if requested == "cpu":
+        return "cpu"
+    cuda_available = False
     try:
         import ctranslate2
 
         if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda"
+            cuda_available = True
     except Exception:
         pass
-    try:
-        import torch
+    if not cuda_available:
+        try:
+            import torch
 
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            pass
+    if requested == "cuda" and not cuda_available:
+        return "cpu"
+    return "cuda" if cuda_available else "cpu"
 
 
-def transcribe_audio(
+def _segments_from_words(words: Sequence[Word], maximum_pause: float = 0.8) -> list[TranscriptSegment]:
+    if not words:
+        return []
+    groups: list[list[Word]] = [[words[0]]]
+    for word in words[1:]:
+        current = groups[-1]
+        if word.start - current[-1].end > maximum_pause or word.end - current[0].start > 12.0:
+            groups.append([word])
+        else:
+            current.append(word)
+    return [
+        TranscriptSegment(group[0].start, group[-1].end, " ".join(item.text for item in group))
+        for group in groups
+    ]
+
+
+def _transcribe_faster_whisper(
     audio_path: Path,
     model_name_or_path: str,
     device: str,
@@ -254,6 +259,7 @@ def transcribe_audio(
             if token and item.start is not None and item.end is not None:
                 words.append(Word(float(item.start), float(item.end), token))
     report = {
+        "backend": "faster-whisper",
         "model": model_name_or_path,
         "device": device,
         "compute_type": compute_type,
@@ -263,6 +269,92 @@ def transcribe_audio(
         "words": len(words),
     }
     return segments, words, report
+
+
+def _transcribe_transformers_whisper(
+    audio_path: Path,
+    model_name_or_path: str,
+    device: str,
+    allow_model_download: bool,
+) -> tuple[list[TranscriptSegment], list[Word], dict[str, Any]]:
+    try:
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Transformers ASR backend requires the Conda pytorch and transformers packages."
+        ) from exc
+
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "local_files_only": not allow_model_download,
+        "low_cpu_mem_usage": True,
+    }
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name_or_path, **load_kwargs)
+    processor = AutoProcessor.from_pretrained(
+        model_name_or_path,
+        local_files_only=not allow_model_download,
+    )
+    asr = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        chunk_length_s=28,
+        stride_length_s=(4, 2),
+        torch_dtype=dtype,
+        device=0 if device == "cuda" else -1,
+    )
+    result = asr(
+        str(audio_path),
+        return_timestamps="word",
+        generate_kwargs={"language": "english", "task": "transcribe"},
+    )
+    words: list[Word] = []
+    for item in result.get("chunks", []):
+        timestamp = item.get("timestamp") or (None, None)
+        start, end = timestamp
+        token = " ".join(str(item.get("text", "")).strip().split())
+        if token and start is not None and end is not None:
+            words.append(Word(float(start), float(end), token))
+    segments = _segments_from_words(words)
+    report = {
+        "backend": "transformers",
+        "model": model_name_or_path,
+        "device": device,
+        "compute_type": str(dtype).replace("torch.", ""),
+        "language": "en",
+        "segments": len(segments),
+        "words": len(words),
+    }
+    return segments, words, report
+
+
+def transcribe_audio(
+    audio_path: Path,
+    model_name_or_path: str,
+    device: str,
+    allow_model_download: bool,
+    backend: str = "auto",
+) -> tuple[list[TranscriptSegment], list[Word], dict[str, Any]]:
+    if backend in {"auto", "faster-whisper"}:
+        try:
+            return _transcribe_faster_whisper(
+                audio_path,
+                model_name_or_path,
+                device,
+                allow_model_download,
+            )
+        except (ImportError, RuntimeError) as exc:
+            if backend == "faster-whisper" or "Install faster-whisper" not in str(exc):
+                raise
+    return _transcribe_transformers_whisper(
+        audio_path,
+        model_name_or_path,
+        device,
+        allow_model_download,
+    )
 
 
 def merge_intervals(intervals: Sequence[Interval], maximum_gap: float = 0.45) -> list[Interval]:
@@ -318,19 +410,50 @@ def build_gaps(
 def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> list[Shot]:
     try:
         from scenedetect import ContentDetector, detect
-    except ImportError as exc:
-        raise RuntimeError("Install scenedetect to run shot detection.") from exc
+    except ImportError:
+        ContentDetector = None
+        detect = None
 
-    scene_list = detect(str(video_path), ContentDetector(threshold=threshold), show_progress=False)
-    if not scene_list:
-        return [Shot(1, 0.0, duration)]
-    shots = [
-        Shot(index, float(start.get_seconds()), min(duration, float(end.get_seconds())))
-        for index, (start, end) in enumerate(scene_list, start=1)
-    ]
-    if shots and shots[-1].end < duration:
-        shots[-1].end = duration
-    return shots
+    if ContentDetector is not None and detect is not None:
+        scene_list = detect(str(video_path), ContentDetector(threshold=threshold), show_progress=False)
+        if not scene_list:
+            return [Shot(1, 0.0, duration)]
+        shots = [
+            Shot(index, float(start.get_seconds()), min(duration, float(end.get_seconds())))
+            for index, (start, end) in enumerate(scene_list, start=1)
+        ]
+        if shots and shots[-1].end < duration:
+            shots[-1].end = duration
+        return shots
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path}")
+    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    boundaries = [0.0]
+    previous: np.ndarray | None = None
+    frame_index = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                score = float(np.mean(cv2.absdiff(previous, gray)))
+                timestamp = frame_index / fps
+                if score >= threshold and timestamp - boundaries[-1] >= 0.3:
+                    boundaries.append(timestamp)
+            previous = gray
+            frame_index += 1
+    finally:
+        capture.release()
+    boundaries.append(duration)
+    return [
+        Shot(index, start, end)
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), start=1)
+        if end - start > 0.05
+    ] or [Shot(1, 0.0, duration)]
 
 
 def frame_at(capture: cv2.VideoCapture, seconds: float) -> np.ndarray | None:
@@ -570,14 +693,14 @@ class Qwen25Backend(VisualBackend):
     def __init__(self, model_path: str, device: str) -> None:
         try:
             import torch
-            from qwen_vl_utils import process_vision_info
+            from PIL import Image
             from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen backend requires torch, transformers, accelerate, qwen-vl-utils, and Pillow."
+                "Qwen backend requires the Conda pytorch, transformers, accelerate, and Pillow packages."
             ) from exc
         self.torch = torch
-        self.process_vision_info = process_vision_info
+        self.image_type = Image
         self.device = device
         dtype = torch.float16 if device == "cuda" else torch.float32
         model_kwargs: dict[str, Any] = {
@@ -617,11 +740,13 @@ class Qwen25Backend(VisualBackend):
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         chat_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = self.process_vision_info(messages)
+        image_inputs = []
+        for path in frames:
+            with self.image_type.open(path) as image:
+                image_inputs.append(image.convert("RGB"))
         inputs = self.processor(
             text=[chat_text],
             images=image_inputs,
-            videos=video_inputs,
             padding=True,
             return_tensors="pt",
         )
@@ -735,17 +860,63 @@ def make_decisions(
     return decisions
 
 
-def resolve_tts_backend(requested: str, piper_model: str | None) -> tuple[str, str]:
-    candidates = [requested] if requested != "auto" else ["piper", "espeak-ng", "say"]
+def resolve_tts_backend(
+    requested: str,
+    piper_model: str | None,
+    transformers_model: str | None,
+) -> tuple[str, str]:
+    candidates = [requested] if requested != "auto" else ["transformers", "piper", "espeak-ng", "say"]
     for candidate in candidates:
+        if candidate == "transformers" and transformers_model:
+            return candidate, transformers_model
         executable = shutil.which(candidate)
         if candidate == "piper" and executable and piper_model:
             return candidate, executable
         if candidate in {"espeak-ng", "say"} and executable:
             return candidate, executable
     raise RuntimeError(
-        "No offline TTS backend found. Install piper with a local model, espeak-ng, or use macOS say."
+        "No offline TTS backend found. Supply --tts-model for Conda-native Transformers TTS, "
+        "or provide piper, espeak-ng, or macOS say."
     )
+
+
+_TRANSFORMERS_TTS_CACHE: dict[str, tuple[Any, Any, Any, int, str]] = {}
+
+
+def synthesize_transformers_tts(text: str, output: Path, model_path: str, device: str) -> Path:
+    cache_key = f"{model_path}:{device}"
+    if cache_key not in _TRANSFORMERS_TTS_CACHE:
+        try:
+            import torch
+            from transformers import AutoTokenizer, VitsModel
+        except ImportError as exc:
+            raise RuntimeError("Transformers TTS requires the Conda pytorch and transformers packages.") from exc
+        dtype = torch.float32
+        model = VitsModel.from_pretrained(
+            model_path,
+            local_files_only=True,
+            torch_dtype=dtype,
+        ).to(device)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        _TRANSFORMERS_TTS_CACHE[cache_key] = (
+            torch,
+            tokenizer,
+            model,
+            int(model.config.sampling_rate),
+            device,
+        )
+    torch, tokenizer, model, sample_rate, model_device = _TRANSFORMERS_TTS_CACHE[cache_key]
+    inputs = tokenizer(text, return_tensors="pt").to(model_device)
+    with torch.inference_mode():
+        waveform = model(**inputs).waveform.squeeze().detach().float().cpu().numpy()
+    pcm = (np.clip(waveform, -1.0, 1.0) * 32767.0).astype(np.int16)
+    with wave.open(str(output), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(pcm.tobytes())
+    return output
 
 
 def synthesize_text(
@@ -754,7 +925,15 @@ def synthesize_text(
     backend: str,
     executable: str,
     piper_model: str | None,
+    device: str,
 ) -> Path:
+    if backend == "transformers":
+        return synthesize_transformers_tts(
+            text,
+            output_stem.with_suffix(".wav"),
+            executable,
+            device,
+        )
     if backend == "piper":
         output = output_stem.with_suffix(".wav")
         run_command([executable, "--model", str(piper_model), "--output_file", str(output)], input_text=text)
@@ -782,10 +961,12 @@ def synthesize_decisions(
     output_dir: Path,
     requested_backend: str,
     piper_model: str | None,
+    transformers_model: str | None,
+    device: str,
     ffprobe: str,
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    backend, executable = resolve_tts_backend(requested_backend, piper_model)
+    backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
     for index, decision in enumerate(decisions, start=1):
         if decision.decision != "AD":
             continue
@@ -798,6 +979,7 @@ def synthesize_decisions(
                 backend,
                 executable,
                 piper_model,
+                device,
             )
             duration = probe_duration(audio_path, ffprobe)
             if duration <= available:
@@ -966,11 +1148,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-video", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--asr-model", default="small.en", help="Local path or cached faster-whisper model name")
+    parser.add_argument(
+        "--asr-backend",
+        choices=["auto", "transformers", "faster-whisper"],
+        default="auto",
+        help="auto uses faster-whisper when installed, otherwise Conda-native Transformers",
+    )
+    parser.add_argument(
+        "--asr-model",
+        default="openai/whisper-small.en",
+        help="Local Whisper model directory; model downloading is disabled by default",
+    )
     parser.add_argument("--allow-model-download", action="store_true", help="Disabled by default for offline runs")
     parser.add_argument("--visual-backend", choices=["heuristic", "qwen25"], default="heuristic")
     parser.add_argument("--vlm-model", help="Local Qwen2.5-VL model directory")
-    parser.add_argument("--tts-backend", choices=["auto", "piper", "espeak-ng", "say"], default="auto")
+    parser.add_argument(
+        "--tts-backend",
+        choices=["auto", "transformers", "piper", "espeak-ng", "say"],
+        default="auto",
+    )
+    parser.add_argument("--tts-model", help="Local Transformers VITS TTS model directory")
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
@@ -1000,7 +1197,11 @@ def main() -> None:
     analysis_wav = work_dir / "analysis-audio.wav"
     extract_analysis_audio(input_video, analysis_wav, ffmpeg)
     segments, words, asr_report = transcribe_audio(
-        analysis_wav, args.asr_model, device, args.allow_model_download
+        analysis_wav,
+        args.asr_model,
+        device,
+        args.allow_model_download,
+        args.asr_backend,
     )
     speech = speech_intervals_from_words(words, media.duration)
     gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
@@ -1027,6 +1228,8 @@ def main() -> None:
         work_dir / "narration",
         args.tts_backend,
         args.piper_model,
+        args.tts_model,
+        device,
         ffprobe,
     )
 

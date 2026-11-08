@@ -1,0 +1,18 @@
+name: offline-ad-cpu
+channels:
+  - pytorch
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - cpuonly
+  - pytorch>=2.2
+  - transformers>=4.49,<5
+  - accelerate>=1.2,<2
+  - safetensors
+  - sentencepiece
+  - pillow>=10,<13
+  - numpy>=1.26,<3
+  - opencv>=4.10,<5
+  - ffmpeg>=6,<8
+
