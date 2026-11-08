@@ -52,6 +52,12 @@ No input or output video is stored in this repository.
 No `venv` or `pip` command is required. From the repository root, create one
 of the supplied environments.
 
+On Lanta, load Conda first:
+
+```bash
+module load Mamba/23.11.0-0
+```
+
 CPU environment:
 
 ```bash
@@ -65,6 +71,9 @@ GPU environment:
 bash scripts/create_conda_env.sh gpu
 conda activate offline-ad-gpu
 ```
+
+The setup script creates a missing environment or updates the existing one
+with `--prune`, so it is safe to run again after pulling dependency changes.
 
 The GPU file uses `pytorch-cuda=12.1`. The cluster's NVIDIA driver must be
 new enough for that runtime; no system CUDA toolkit is required inside the
