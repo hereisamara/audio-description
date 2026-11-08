@@ -38,6 +38,7 @@ offline_ad_poc/
 scripts/
   create_conda_env.sh
   run_lanta.sh
+  submit_lanta_gpu.sh
 tests/
   test_pipeline.py
 environment-cpu.yml
@@ -145,7 +146,54 @@ bash scripts/run_lanta.sh \
 
 `--device auto` uses CUDA when detected and CPU otherwise.
 
-## 6. Tests
+## 6. Submit a Lanta GPU job
+
+The supplied Slurm script uses the `gpu` partition, project `lt200246`, one
+GPU, one Python task, and 16 CPU cores. It loads `Mamba/23.11.0-0` and runs the
+`offline-ad-gpu` Conda environment.
+
+By default, it expects this layout inside the repository:
+
+```text
+models/whisper-small.en-transformers/
+models/Qwen2.5-VL-3B-Instruct/
+models/mms-tts-eng/
+inputs/real-scene-01.mp4
+```
+
+Submit from the repository root:
+
+```bash
+sbatch scripts/submit_lanta_gpu.sh \
+  "$PWD/inputs/real-scene-01.mp4"
+```
+
+Optionally provide explicit output and work paths:
+
+```bash
+sbatch scripts/submit_lanta_gpu.sh \
+  /lustrefs/disk/home/khtun/audio-description/inputs/real-scene-01.mp4 \
+  /lustrefs/disk/home/khtun/audio-description/outputs/real-scene-01-ad.mp4 \
+  /lustrefs/disk/home/khtun/audio-description/outputs/real-scene-01-work
+```
+
+For models stored elsewhere, override their locations when submitting:
+
+```bash
+ASR_MODEL=/lustrefs/disk/home/khtun/models/whisper-small.en-transformers \
+VLM_MODEL=/lustrefs/disk/home/khtun/models/Qwen2.5-VL-3B-Instruct \
+TTS_MODEL=/lustrefs/disk/home/khtun/models/mms-tts-eng \
+sbatch scripts/submit_lanta_gpu.sh "$PWD/inputs/real-scene-01.mp4"
+```
+
+Monitor the job with:
+
+```bash
+squeue -u "$USER"
+tail -f audio_ad.JOB_ID.out
+```
+
+## 7. Tests
 
 ```bash
 python -m unittest discover -s tests -v
