@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,6 +12,7 @@ from offline_ad_poc.pipeline import (
     Shot,
     Word,
     _segments_from_words,
+    _whisper_generate_kwargs,
     build_gaps,
     limit_words,
     merge_intervals,
@@ -60,6 +62,13 @@ class PipelineUnitTests(unittest.TestCase):
         segments = _segments_from_words(words)
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[0].text, "hello there")
+
+    def test_english_only_whisper_omits_language_and_task(self) -> None:
+        self.assertEqual(_whisper_generate_kwargs(SimpleNamespace(is_multilingual=False)), {})
+        self.assertEqual(
+            _whisper_generate_kwargs(SimpleNamespace(is_multilingual=True)),
+            {"language": "english", "task": "transcribe"},
+        )
 
 
 if __name__ == "__main__":

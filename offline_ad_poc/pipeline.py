@@ -221,6 +221,12 @@ def _segments_from_words(words: Sequence[Word], maximum_pause: float = 0.8) -> l
     ]
 
 
+def _whisper_generate_kwargs(generation_config: Any) -> dict[str, str]:
+    if bool(getattr(generation_config, "is_multilingual", False)):
+        return {"language": "english", "task": "transcribe"}
+    return {}
+
+
 def _transcribe_faster_whisper(
     audio_path: Path,
     model_name_or_path: str,
@@ -306,10 +312,12 @@ def _transcribe_transformers_whisper(
         torch_dtype=dtype,
         device=0 if device == "cuda" else -1,
     )
+    is_multilingual = bool(getattr(model.generation_config, "is_multilingual", False))
+    generate_kwargs = _whisper_generate_kwargs(model.generation_config)
     result = asr(
         str(audio_path),
         return_timestamps="word",
-        generate_kwargs={"language": "english", "task": "transcribe"},
+        generate_kwargs=generate_kwargs,
     )
     words: list[Word] = []
     for item in result.get("chunks", []):
@@ -325,6 +333,7 @@ def _transcribe_transformers_whisper(
         "device": device,
         "compute_type": str(dtype).replace("torch.", ""),
         "language": "en",
+        "is_multilingual": is_multilingual,
         "segments": len(segments),
         "words": len(words),
     }
