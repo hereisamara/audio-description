@@ -53,7 +53,11 @@ echo "Repository: $repo_dir"
 echo "Conda environment: $conda_env"
 echo "Input: $input_video"
 echo "Output: $output_video"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not-set}"
 nvidia-smi
+
+conda run --no-capture-output -n "$conda_env" \
+  python -c 'import os, sys, torch; print("PyTorch:", torch.__version__); print("PyTorch CUDA build:", torch.version.cuda); print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES")); print("CUDA available:", torch.cuda.is_available()); print("CUDA device count:", torch.cuda.device_count()); sys.exit(0 if torch.cuda.is_available() else 3)'
 
 conda run --no-capture-output -n "$conda_env" \
   python -m offline_ad_poc.pipeline \

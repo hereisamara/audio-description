@@ -202,6 +202,15 @@ squeue -u "$USER"
 tail -f audio_ad.JOB_ID.out
 ```
 
+The job performs a CUDA preflight before loading the models. It records
+`CUDA_VISIBLE_DEVICES`, the PyTorch build, PyTorch's CUDA runtime, availability,
+and visible device count in the output log. If this preflight fails after an
+environment update, inspect the installed variants with:
+
+```bash
+conda list -n offline-ad-gpu | grep -E 'pytorch|cuda|cudnn'
+```
+
 ## 7. Tests
 
 ```bash

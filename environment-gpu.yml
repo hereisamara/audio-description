@@ -6,6 +6,7 @@ channels:
   - nodefaults
 dependencies:
   - python=3.11
+  - pytorch-mutex=1.0=cuda
   - pytorch>=2.2
   - pytorch-cuda=12.1
   - transformers>=4.49,<5
