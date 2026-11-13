@@ -6,8 +6,7 @@ channels:
 dependencies:
   - python=3.11
   - cpuonly
-  - pytorch=2.5.1
-  - torchvision=0.20.1
+  - pytorch>=2.2
   - transformers>=4.49,<5
   - accelerate>=1.2,<2
   - safetensors

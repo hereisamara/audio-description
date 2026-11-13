@@ -79,8 +79,7 @@ The GPU file uses `pytorch-cuda=12.1`. The cluster's NVIDIA driver must be
 new enough for that runtime; no system CUDA toolkit is required inside the
 environment. If Lanta requires a different approved CUDA runtime, change only
 that version in `environment-gpu.yml` before creating the environment.
-PyTorch and Torchvision are pinned as a compatible pair because Qwen's visual
-processor requires Torchvision even when the pipeline supplies still images.
+Qwen uses Transformers' PIL image processor, so Torchvision is not required.
 
 Verify the environment:
 

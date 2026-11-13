@@ -698,12 +698,31 @@ class HeuristicBackend(VisualBackend):
         }
 
 
+def expand_qwen_image_tokens(
+    chat_text: str,
+    image_token: str,
+    image_grid_thw: Sequence[Sequence[int]],
+    merge_size: int,
+) -> str:
+    expanded = chat_text
+    for grid in image_grid_thw:
+        token_count = math.prod(int(value) for value in grid) // (merge_size**2)
+        if image_token not in expanded:
+            raise ValueError("Qwen chat template did not emit enough image placeholder tokens")
+        expanded = expanded.replace(image_token, image_token * token_count, 1)
+    return expanded
+
+
 class Qwen25Backend(VisualBackend):
     def __init__(self, model_path: str, device: str) -> None:
         try:
             import torch
             from PIL import Image
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import (
+                AutoImageProcessor,
+                AutoTokenizer,
+                Qwen2_5_VLForConditionalGeneration,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "Qwen backend requires the Conda pytorch, transformers, accelerate, and Pillow packages."
@@ -723,7 +742,12 @@ class Qwen25Backend(VisualBackend):
         if device == "cpu":
             self.model.to("cpu")
         self.model.eval()
-        self.processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            model_path,
+            local_files_only=True,
+            use_fast=False,
+        )
 
     def decide(
         self,
@@ -748,23 +772,46 @@ class Qwen25Backend(VisualBackend):
         content = [{"type": "image", "image": str(path.resolve())} for path in frames]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
-        chat_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        chat_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         image_inputs = []
         for path in frames:
             with self.image_type.open(path) as image:
                 image_inputs.append(image.convert("RGB"))
-        inputs = self.processor(
-            text=[chat_text],
-            images=image_inputs,
-            padding=True,
-            return_tensors="pt",
+        image_features = self.image_processor(images=image_inputs, return_tensors="pt")
+        image_grid_thw = image_features["image_grid_thw"]
+        merge_size = int(
+            getattr(
+                self.image_processor,
+                "merge_size",
+                self.model.config.vision_config.spatial_merge_size,
+            )
         )
+        image_token = getattr(self.tokenizer, "image_token", "<|image_pad|>")
+        chat_text = expand_qwen_image_tokens(
+            chat_text,
+            image_token,
+            image_grid_thw.tolist(),
+            merge_size,
+        )
+        text_features = self.tokenizer([chat_text], padding=True, return_tensors="pt")
+        inputs = {**text_features, **image_features}
         model_device = next(self.model.parameters()).device
-        inputs = inputs.to(model_device)
+        inputs = {
+            key: value.to(model_device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
         with self.torch.inference_mode():
             generated = self.model.generate(**inputs, max_new_tokens=160, do_sample=False)
-        trimmed = [output[len(source) :] for source, output in zip(inputs.input_ids, generated)]
-        decoded = self.processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        trimmed = [output[len(source) :] for source, output in zip(inputs["input_ids"], generated)]
+        decoded = self.tokenizer.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
         return json_object_from_text(decoded)
 
 

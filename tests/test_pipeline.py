@@ -14,6 +14,7 @@ from offline_ad_poc.pipeline import (
     _segments_from_words,
     _whisper_generate_kwargs,
     build_gaps,
+    expand_qwen_image_tokens,
     limit_words,
     merge_intervals,
     segment_scenes,
@@ -69,6 +70,15 @@ class PipelineUnitTests(unittest.TestCase):
             _whisper_generate_kwargs(SimpleNamespace(is_multilingual=True)),
             {"language": "english", "task": "transcribe"},
         )
+
+    def test_qwen_image_placeholders_expand_from_grid(self) -> None:
+        expanded = expand_qwen_image_tokens(
+            "start <|image_pad|> middle <|image_pad|> end",
+            "<|image_pad|>",
+            [[1, 4, 4], [1, 2, 4]],
+            merge_size=2,
+        )
+        self.assertEqual(expanded.count("<|image_pad|>"), 6)
 
 
 if __name__ == "__main__":
