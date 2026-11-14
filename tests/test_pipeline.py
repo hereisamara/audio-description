@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ import numpy as np
 from offline_ad_poc.pipeline import (
     Gap,
     Interval,
+    RuntimeProfiler,
     Shot,
     Word,
     _segments_from_words,
@@ -79,6 +82,22 @@ class PipelineUnitTests(unittest.TestCase):
             merge_size=2,
         )
         self.assertEqual(expanded.count("<|image_pad|>"), 6)
+
+    def test_runtime_profiler_writes_stage_events_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profiler = RuntimeProfiler(Path(directory))
+            with profiler.stage("example", method="unit-test") as details:
+                details["items"] = 3
+            summary = profiler.finalize()
+
+            event = json.loads(profiler.events_path.read_text(encoding="utf-8"))
+            self.assertEqual(event["stage"], "example")
+            self.assertEqual(event["method"], "unit-test")
+            self.assertEqual(event["items"], 3)
+            self.assertEqual(event["status"], "completed")
+            self.assertGreaterEqual(event["elapsed_seconds"], 0.0)
+            self.assertEqual(summary["stages"], [event])
+            self.assertTrue(profiler.summary_path.exists())
 
 
 if __name__ == "__main__":

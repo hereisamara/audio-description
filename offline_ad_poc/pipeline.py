@@ -19,10 +19,12 @@ import subprocess
 import sys
 import time
 import wave
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
@@ -51,6 +53,77 @@ def configure_logging(work_dir: Path) -> Path:
     LOGGER.addHandler(file_handler)
     LOGGER.info("runtime_log path=%s", log_path)
     return log_path
+
+
+class RuntimeProfiler:
+    """Persist wall-clock stage timings as the pipeline runs."""
+
+    def __init__(self, work_dir: Path) -> None:
+        self.events_path = work_dir / "runtime-events.jsonl"
+        self.summary_path = work_dir / "runtime-summary.json"
+        self.events_path.write_text("", encoding="utf-8")
+        self.events: list[dict[str, Any]] = []
+        self.started_perf = time.perf_counter()
+        self.started_at = datetime.now(timezone.utc)
+
+    @contextmanager
+    def stage(self, name: str, **details: Any) -> Iterator[dict[str, Any]]:
+        stage_details = dict(details)
+        started = time.perf_counter()
+        offset = started - self.started_perf
+        LOGGER.info("stage_start stage=%s", name)
+        status = "completed"
+        error: BaseException | None = None
+        try:
+            yield stage_details
+        except BaseException as exc:
+            status = "failed"
+            error = exc
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            event: dict[str, Any] = {
+                "index": len(self.events) + 1,
+                "stage": name,
+                "status": status,
+                "started_offset_seconds": round(offset, 6),
+                "elapsed_seconds": round(elapsed, 6),
+                **stage_details,
+            }
+            if error is not None:
+                event["error_type"] = type(error).__name__
+                event["error"] = str(error)
+            self.events.append(event)
+            with self.events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            LOGGER.log(
+                logging.INFO if status == "completed" else logging.ERROR,
+                "stage_end stage=%s status=%s elapsed_seconds=%.6f",
+                name,
+                status,
+                elapsed,
+            )
+
+    def finalize(self) -> dict[str, Any]:
+        finished_at = datetime.now(timezone.utc)
+        summary = {
+            "started_at": self.started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "total_elapsed_seconds": round(time.perf_counter() - self.started_perf, 6),
+            "event_log": str(self.events_path),
+            "stages": self.events,
+        }
+        self.summary_path.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        LOGGER.info(
+            "runtime_summary path=%s total_elapsed_seconds=%.6f stages=%d",
+            self.summary_path,
+            summary["total_elapsed_seconds"],
+            len(self.events),
+        )
+        return summary
 
 
 @dataclass
@@ -467,7 +540,12 @@ def build_gaps(
     return gaps
 
 
-def _detect_shots_opencv(video_path: Path, duration: float, threshold: float) -> list[Shot]:
+def _detect_shots_opencv(
+    video_path: Path,
+    duration: float,
+    threshold: float,
+    runtime_details: dict[str, Any] | None = None,
+) -> list[Shot]:
     """Fallback content-difference detector that requires only OpenCV."""
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -497,6 +575,12 @@ def _detect_shots_opencv(video_path: Path, duration: float, threshold: float) ->
         for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), start=1)
         if end - start > 0.05
     ] or [Shot(1, 0.0, duration)]
+    if runtime_details is not None:
+        runtime_details.update(
+            method="opencv_frame_difference",
+            threshold=threshold,
+            shots=len(shots),
+        )
     LOGGER.info(
         "method stage=shot_detection backend=opencv_frame_difference threshold=%.3f shots=%d",
         threshold,
@@ -505,7 +589,12 @@ def _detect_shots_opencv(video_path: Path, duration: float, threshold: float) ->
     return shots
 
 
-def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> list[Shot]:
+def detect_shots(
+    video_path: Path,
+    duration: float,
+    threshold: float = 27.0,
+    runtime_details: dict[str, Any] | None = None,
+) -> list[Shot]:
     try:
         from scenedetect import ContentDetector, detect
     except ImportError as exc:
@@ -514,7 +603,9 @@ def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> 
             "to=opencv_frame_difference reason=%s",
             str(exc).replace("\n", " "),
         )
-        return _detect_shots_opencv(video_path, duration, threshold)
+        if runtime_details is not None:
+            runtime_details["fallback_reason"] = str(exc)
+        return _detect_shots_opencv(video_path, duration, threshold, runtime_details)
 
     try:
         scene_list = detect(str(video_path), ContentDetector(threshold=threshold), show_progress=False)
@@ -525,9 +616,18 @@ def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> 
             type(exc).__name__,
             str(exc).replace("\n", " "),
         )
-        return _detect_shots_opencv(video_path, duration, threshold)
+        if runtime_details is not None:
+            runtime_details["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+        return _detect_shots_opencv(video_path, duration, threshold, runtime_details)
     else:
         if not scene_list:
+            if runtime_details is not None:
+                runtime_details.update(
+                    method="scenedetect.ContentDetector",
+                    threshold=threshold,
+                    shots=1,
+                    no_boundaries=True,
+                )
             LOGGER.info(
                 "method stage=shot_detection backend=scenedetect.ContentDetector "
                 "threshold=%.3f shots=1 no_boundaries=true",
@@ -540,6 +640,12 @@ def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> 
         ]
         if shots and shots[-1].end < duration:
             shots[-1].end = duration
+        if runtime_details is not None:
+            runtime_details.update(
+                method="scenedetect.ContentDetector",
+                threshold=threshold,
+                shots=len(shots),
+            )
         LOGGER.info(
             "method stage=shot_detection backend=scenedetect.ContentDetector threshold=%.3f shots=%d",
             threshold,
@@ -1340,75 +1446,138 @@ def main() -> None:
     )
     if not input_video.exists():
         raise FileNotFoundError(input_video)
+    profiler = RuntimeProfiler(work_dir)
 
-    ffmpeg, ffprobe = resolve_ffmpeg_tools()
-    media = probe_media(input_video, ffprobe)
+    with profiler.stage("media_tools", method="environment_or_path_lookup"):
+        ffmpeg, ffprobe = resolve_ffmpeg_tools()
+    with profiler.stage("media_probe", method="ffprobe") as stage:
+        media = probe_media(input_video, ffprobe)
+        stage.update(
+            duration_seconds=round(media.duration, 6),
+            width=media.width,
+            height=media.height,
+            fps=round(media.fps, 6),
+            has_audio=media.has_audio,
+        )
     if not media.has_audio:
         raise ValueError("Prototype currently requires an input audio stream")
-    device = choose_device(args.device)
+    with profiler.stage("device_selection", method="cuda_capability_check") as stage:
+        device = choose_device(args.device)
+        stage.update(requested_device=args.device, selected_device=device)
     if args.device == "cuda" and device != "cuda":
         raise RuntimeError("CUDA was requested but is not available")
 
     analysis_wav = work_dir / "analysis-audio.wav"
-    extract_analysis_audio(input_video, analysis_wav, ffmpeg)
-    segments, words, asr_report = transcribe_audio(
-        analysis_wav,
-        args.asr_model,
-        device,
-        args.allow_model_download,
-        args.asr_backend,
-    )
-    speech = speech_intervals_from_words(words, media.duration)
-    gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
+    with profiler.stage("audio_extraction", method="ffmpeg_pcm_s16le_16khz_mono"):
+        extract_analysis_audio(input_video, analysis_wav, ffmpeg)
+    with profiler.stage("asr", requested_method=args.asr_backend) as stage:
+        segments, words, asr_report = transcribe_audio(
+            analysis_wav,
+            args.asr_model,
+            device,
+            args.allow_model_download,
+            args.asr_backend,
+        )
+        stage.update(
+            method=asr_report["backend"],
+            model=asr_report["model"],
+            segments=len(segments),
+            words=len(words),
+        )
+    with profiler.stage("speech_gap_detection", method="word_intervals_padding_merge") as stage:
+        speech = speech_intervals_from_words(words, media.duration)
+        gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
+        stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
 
-    shots = detect_shots(input_video, media.duration, threshold=args.shot_threshold)
-    histograms = sample_shot_features(input_video, shots, work_dir / "keyframes")
-    wav_features_by_shot(analysis_wav, shots)
-    attach_transcripts(shots, segments)
-    scenes = segment_scenes(shots, histograms, boundary_threshold=args.scene_threshold)
+    with profiler.stage("shot_detection") as stage:
+        shots = detect_shots(
+            input_video,
+            media.duration,
+            threshold=args.shot_threshold,
+            runtime_details=stage,
+        )
+    with profiler.stage("shot_visual_features", method="opencv_hsv_histogram_and_motion"):
+        histograms = sample_shot_features(input_video, shots, work_dir / "keyframes")
+    with profiler.stage("shot_audio_features", method="numpy_rms_and_fft_centroid"):
+        wav_features_by_shot(analysis_wav, shots)
+    with profiler.stage("transcript_shot_alignment", method="timestamp_overlap"):
+        attach_transcripts(shots, segments)
+    with profiler.stage("scene_segmentation", method="weighted_visual_audio_text_distance") as stage:
+        scenes = segment_scenes(shots, histograms, boundary_threshold=args.scene_threshold)
+        stage.update(boundary_threshold=args.scene_threshold, scenes=len(scenes))
 
-    backend = choose_backend(args.visual_backend, args.vlm_model, device)
-    decisions = make_decisions(
-        input_video,
-        gaps,
-        shots,
-        scenes,
-        segments,
-        backend,
-        work_dir / "evidence-frames",
-        args.maximum_gaps,
-    )
-    tts_backend, decisions = synthesize_decisions(
-        decisions,
-        work_dir / "narration",
-        args.tts_backend,
-        args.piper_model,
-        args.tts_model,
-        device,
-        ffprobe,
-    )
+    with profiler.stage("visual_backend_initialization", method=args.visual_backend):
+        backend = choose_backend(args.visual_backend, args.vlm_model, device)
+    with profiler.stage("ad_decisions", method=args.visual_backend) as stage:
+        decisions = make_decisions(
+            input_video,
+            gaps,
+            shots,
+            scenes,
+            segments,
+            backend,
+            work_dir / "evidence-frames",
+            args.maximum_gaps,
+        )
+        stage.update(
+            processed_gaps=len(decisions),
+            ad_decisions=sum(item.decision == "AD" for item in decisions),
+            wait_decisions=sum(item.decision == "WAIT" for item in decisions),
+        )
+    with profiler.stage("tts", requested_method=args.tts_backend) as stage:
+        tts_backend, decisions = synthesize_decisions(
+            decisions,
+            work_dir / "narration",
+            args.tts_backend,
+            args.piper_model,
+            args.tts_model,
+            device,
+            ffprobe,
+        )
+        stage.update(
+            method=tts_backend,
+            generated_cues=sum(bool(item.tts_path) for item in decisions),
+        )
 
-    write_vtt(decisions, work_dir / "descriptions.vtt")
-    write_json(work_dir / "media.json", asdict(media))
-    write_json(work_dir / "transcript.json", {"report": asr_report, "segments": [asdict(x) for x in segments], "words": [asdict(x) for x in words]})
-    write_json(work_dir / "speech-and-gaps.json", {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]})
-    write_json(work_dir / "shots.json", [asdict(x) for x in shots])
-    write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
-    write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
+    with profiler.stage("artifact_write", method="json_and_webvtt"):
+        write_vtt(decisions, work_dir / "descriptions.vtt")
+        write_json(work_dir / "media.json", asdict(media))
+        write_json(
+            work_dir / "transcript.json",
+            {
+                "report": asr_report,
+                "segments": [asdict(x) for x in segments],
+                "words": [asdict(x) for x in words],
+            },
+        )
+        write_json(
+            work_dir / "speech-and-gaps.json",
+            {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]},
+        )
+        write_json(work_dir / "shots.json", [asdict(x) for x in shots])
+        write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
+        write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
 
-    mix_described_video(input_video, output_video, decisions, ffmpeg)
-    validate_decode(output_video, ffmpeg)
+    with profiler.stage("video_mix", method="ffmpeg_filter_complex_audio_mix"):
+        mix_described_video(input_video, output_video, decisions, ffmpeg)
+    with profiler.stage("output_validation", method="ffmpeg_full_decode"):
+        validate_decode(output_video, ffmpeg)
     elapsed = time.perf_counter() - started
-    report = {
-        "input": str(input_video),
-        "output": str(output_video),
-        "device": device,
-        "visual_backend": args.visual_backend,
-        "tts_backend": tts_backend,
-        "offline": not args.allow_model_download,
-        "metrics": evaluate(media, speech, shots, scenes, gaps, decisions, elapsed),
-    }
-    write_json(work_dir / "evaluation-report.json", report)
+    with profiler.stage("evaluation", method="internal_metrics"):
+        report = {
+            "input": str(input_video),
+            "output": str(output_video),
+            "device": device,
+            "visual_backend": args.visual_backend,
+            "tts_backend": tts_backend,
+            "offline": not args.allow_model_download,
+            "runtime_log": str(work_dir / "runtime.log"),
+            "runtime_events": str(profiler.events_path),
+            "runtime_summary": str(profiler.summary_path),
+            "metrics": evaluate(media, speech, shots, scenes, gaps, decisions, elapsed),
+        }
+        write_json(work_dir / "evaluation-report.json", report)
+    profiler.finalize()
     print(json.dumps(report, indent=2))
 
 
