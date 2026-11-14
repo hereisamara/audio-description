@@ -16,7 +16,7 @@ real input video
   -> FFmpeg media inspection and analysis audio
   -> local Whisper word timestamps (Conda-native Transformers backend)
   -> speech-safe narration gaps
-  -> OpenCV content-difference shots
+  -> PySceneDetect ContentDetector when available; logged OpenCV fallback otherwise
   -> lightweight visual/audio/transcript scene grouping
   -> local visual backend: heuristic or Qwen2.5-VL
   -> AD or WAIT decision
@@ -203,6 +203,12 @@ squeue -u "$USER"
 tail -f audio_ad.JOB_ID.out
 ```
 
+The pipeline also writes a dedicated live log inside the work directory:
+
+```bash
+tail -f outputs/real-scene-01-work/runtime.log
+```
+
 The job performs a CUDA preflight before loading the models. It records
 `CUDA_VISIBLE_DEVICES`, the PyTorch build, PyTorch's CUDA runtime, availability,
 and visible device count in the output log. If this preflight fails after an
@@ -212,7 +218,59 @@ environment update, inspect the installed variants with:
 conda list -n offline-ad-gpu | grep -E 'pytorch|cuda|cudnn'
 ```
 
-## 7. Tests
+## 7. Runtime profiling and optimization logs
+
+Every run records the selected implementation, fallback reason, elapsed time,
+and compute resources for each pipeline stage. The work directory contains:
+
+- `runtime.log`: human-readable live events, including method selection,
+  fallbacks, stage start/end, elapsed time, CPU time, and CUDA peak memory;
+- `runtime-events.jsonl`: one structured record appended immediately after each
+  stage, so completed timings remain available if a later stage fails;
+- `runtime-summary.json`: completed-run hardware information, totals grouped by
+  compute device, the five slowest stages, and all stage records;
+- `evaluation-report.json`: quality metrics plus paths to the three runtime
+  profiling files.
+
+Method lines make optional fallbacks explicit. For example, because
+PySceneDetect is not part of the minimal Conda environments, the normal log is:
+
+```text
+fallback stage=shot_detection from=scenedetect.ContentDetector to=opencv_frame_difference reason=...
+method stage=shot_detection backend=opencv_frame_difference threshold=27.000 shots=14
+```
+
+Each structured stage record includes:
+
+- `stage`, `method`, `status`, and any stage-specific counts;
+- `elapsed_seconds`: wall-clock latency;
+- `cpu_seconds`: Python plus completed child-process CPU time, including FFmpeg;
+- `average_cpu_cores`: `cpu_seconds / elapsed_seconds`, which may be greater
+  than one for multithreaded work;
+- `compute_device`, `uses_cpu`, and `uses_gpu`;
+- `process_peak_rss_mb`: cumulative process peak memory observed by that point;
+- CUDA stages additionally record PyTorch allocated/reserved memory at the
+  start and end and peak allocated/reserved memory.
+
+Inspect the selected methods and fallback decisions:
+
+```bash
+grep -E 'method|fallback' outputs/real-scene-01-work/runtime.log
+```
+
+Print the slowest completed stages without installing an extra analysis tool:
+
+```bash
+python -c 'import json,sys; d=json.load(open(sys.argv[1])); [print("{:9.3f}s  {:4s}  {}  {}".format(x["elapsed_seconds"], x["compute_device"], x["stage"], x.get("method", ""))) for x in d["slowest_stages"]]' \
+  outputs/real-scene-01-work/runtime-summary.json
+```
+
+The CUDA fields measure PyTorch memory and synchronize timed CUDA stages so
+their wall time includes completed GPU work. They do not continuously sample
+GPU utilization; use the Slurm job's monitoring facilities or NVIDIA tooling
+if utilization-over-time traces are required later.
+
+## 8. Tests
 
 ```bash
 python -m unittest discover -s tests -v
@@ -227,7 +285,7 @@ The final MP4 contains:
 - a selectable English `Audio Description` track marked `visual_impaired`.
 
 The ignored work directory contains transcript, gap, shot, scene, evidence,
-decision, narration, WebVTT, and evaluation files.
+decision, narration, WebVTT, evaluation, and runtime profiling files.
 
 ## Current limitations
 
