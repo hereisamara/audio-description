@@ -86,7 +86,8 @@ class PipelineUnitTests(unittest.TestCase):
     def test_runtime_profiler_writes_stage_events_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profiler = RuntimeProfiler(Path(directory))
-            with profiler.stage("example", method="unit-test") as details:
+            profiler.set_hardware({"cpu_count_logical": 4, "cuda_available": False})
+            with profiler.stage("example", method="unit-test", compute_device="cpu") as details:
                 details["items"] = 3
             summary = profiler.finalize()
 
@@ -96,7 +97,14 @@ class PipelineUnitTests(unittest.TestCase):
             self.assertEqual(event["items"], 3)
             self.assertEqual(event["status"], "completed")
             self.assertGreaterEqual(event["elapsed_seconds"], 0.0)
+            self.assertGreaterEqual(event["cpu_seconds"], 0.0)
+            self.assertEqual(event["compute_device"], "cpu")
+            self.assertTrue(event["uses_cpu"])
+            self.assertFalse(event["uses_gpu"])
+            self.assertGreater(event["process_peak_rss_mb"], 0.0)
             self.assertEqual(summary["stages"], [event])
+            self.assertEqual(summary["hardware"]["cpu_count_logical"], 4)
+            self.assertEqual(summary["totals_by_compute_device"]["cpu"]["stages"], 1)
             self.assertTrue(profiler.summary_path.exists())
 
 

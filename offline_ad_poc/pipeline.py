@@ -13,7 +13,9 @@ import json
 import logging
 import math
 import os
+import platform
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -55,6 +57,92 @@ def configure_logging(work_dir: Path) -> Path:
     return log_path
 
 
+def collect_hardware_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python_version": platform.python_version(),
+        "cpu_count_logical": os.cpu_count(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+    try:
+        import torch
+
+        info.update(
+            torch_version=torch.__version__,
+            torch_cuda_build=torch.version.cuda,
+            cuda_available=torch.cuda.is_available(),
+            cuda_device_count=torch.cuda.device_count(),
+        )
+        if torch.cuda.is_available():
+            info["cuda_devices"] = [
+                {
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "total_memory_mb": round(
+                        torch.cuda.get_device_properties(index).total_memory / (1024**2),
+                        3,
+                    ),
+                    "compute_capability": list(torch.cuda.get_device_capability(index)),
+                }
+                for index in range(torch.cuda.device_count())
+            ]
+    except Exception as exc:
+        info["torch_probe_error"] = f"{type(exc).__name__}: {exc}"
+    LOGGER.info("hardware %s", json.dumps(info, ensure_ascii=False, sort_keys=True))
+    return info
+
+
+def _children_cpu_seconds() -> float:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return float(usage.ru_utime + usage.ru_stime)
+
+
+def _process_peak_rss_mb() -> float:
+    value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    divisor = 1024**2 if sys.platform == "darwin" else 1024
+    return value / divisor
+
+
+def _cuda_stage_start(compute_device: str) -> dict[str, Any]:
+    if compute_device != "cuda":
+        return {}
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"gpu_telemetry_error": "CUDA stage requested but torch.cuda is unavailable"}
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        return {
+            "gpu_name": torch.cuda.get_device_name(),
+            "gpu_memory_allocated_start_mb": torch.cuda.memory_allocated() / (1024**2),
+            "gpu_memory_reserved_start_mb": torch.cuda.memory_reserved() / (1024**2),
+        }
+    except Exception as exc:
+        return {"gpu_telemetry_error": f"{type(exc).__name__}: {exc}"}
+
+
+def _cuda_stage_end(compute_device: str) -> dict[str, Any]:
+    if compute_device != "cuda":
+        return {}
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"gpu_telemetry_error": "CUDA stage requested but torch.cuda is unavailable"}
+        torch.cuda.synchronize()
+        return {
+            "gpu_memory_allocated_end_mb": round(torch.cuda.memory_allocated() / (1024**2), 3),
+            "gpu_memory_reserved_end_mb": round(torch.cuda.memory_reserved() / (1024**2), 3),
+            "gpu_memory_peak_allocated_mb": round(torch.cuda.max_memory_allocated() / (1024**2), 3),
+            "gpu_memory_peak_reserved_mb": round(torch.cuda.max_memory_reserved() / (1024**2), 3),
+        }
+    except Exception as exc:
+        return {"gpu_telemetry_error": f"{type(exc).__name__}: {exc}"}
+
+
 class RuntimeProfiler:
     """Persist wall-clock stage timings as the pipeline runs."""
 
@@ -65,13 +153,21 @@ class RuntimeProfiler:
         self.events: list[dict[str, Any]] = []
         self.started_perf = time.perf_counter()
         self.started_at = datetime.now(timezone.utc)
+        self.hardware: dict[str, Any] = {}
+
+    def set_hardware(self, hardware: dict[str, Any]) -> None:
+        self.hardware = hardware
 
     @contextmanager
     def stage(self, name: str, **details: Any) -> Iterator[dict[str, Any]]:
         stage_details = dict(details)
+        compute_device = str(stage_details.setdefault("compute_device", "cpu"))
         started = time.perf_counter()
+        started_cpu = time.process_time()
+        started_children_cpu = _children_cpu_seconds()
+        gpu_start = _cuda_stage_start(compute_device)
         offset = started - self.started_perf
-        LOGGER.info("stage_start stage=%s", name)
+        LOGGER.info("stage_start stage=%s compute_device=%s", name, compute_device)
         status = "completed"
         error: BaseException | None = None
         try:
@@ -82,13 +178,27 @@ class RuntimeProfiler:
             raise
         finally:
             elapsed = time.perf_counter() - started
+            cpu_seconds = (
+                time.process_time()
+                - started_cpu
+                + _children_cpu_seconds()
+                - started_children_cpu
+            )
+            gpu_end = _cuda_stage_end(compute_device)
             event: dict[str, Any] = {
                 "index": len(self.events) + 1,
                 "stage": name,
                 "status": status,
                 "started_offset_seconds": round(offset, 6),
                 "elapsed_seconds": round(elapsed, 6),
+                "cpu_seconds": round(cpu_seconds, 6),
+                "average_cpu_cores": round(cpu_seconds / elapsed, 4) if elapsed > 0 else 0.0,
+                "process_peak_rss_mb": round(_process_peak_rss_mb(), 3),
+                "uses_cpu": True,
+                "uses_gpu": compute_device == "cuda",
                 **stage_details,
+                **gpu_start,
+                **gpu_end,
             }
             if error is not None:
                 event["error_type"] = type(error).__name__
@@ -98,19 +208,44 @@ class RuntimeProfiler:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
             LOGGER.log(
                 logging.INFO if status == "completed" else logging.ERROR,
-                "stage_end stage=%s status=%s elapsed_seconds=%.6f",
+                "stage_end stage=%s status=%s compute_device=%s elapsed_seconds=%.6f "
+                "cpu_seconds=%.6f average_cpu_cores=%.4f gpu_peak_allocated_mb=%s",
                 name,
                 status,
+                compute_device,
                 elapsed,
+                cpu_seconds,
+                cpu_seconds / elapsed if elapsed > 0 else 0.0,
+                gpu_end.get("gpu_memory_peak_allocated_mb", "n/a"),
             )
 
     def finalize(self) -> dict[str, Any]:
         finished_at = datetime.now(timezone.utc)
+        totals_by_device: dict[str, dict[str, float | int]] = {}
+        for event in self.events:
+            device = str(event.get("compute_device", "unknown"))
+            totals = totals_by_device.setdefault(
+                device,
+                {"stages": 0, "elapsed_seconds": 0.0, "cpu_seconds": 0.0},
+            )
+            totals["stages"] += 1
+            totals["elapsed_seconds"] += float(event["elapsed_seconds"])
+            totals["cpu_seconds"] += float(event["cpu_seconds"])
+        for totals in totals_by_device.values():
+            totals["elapsed_seconds"] = round(float(totals["elapsed_seconds"]), 6)
+            totals["cpu_seconds"] = round(float(totals["cpu_seconds"]), 6)
         summary = {
             "started_at": self.started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "total_elapsed_seconds": round(time.perf_counter() - self.started_perf, 6),
             "event_log": str(self.events_path),
+            "hardware": self.hardware,
+            "totals_by_compute_device": totals_by_device,
+            "slowest_stages": sorted(
+                self.events,
+                key=lambda event: float(event["elapsed_seconds"]),
+                reverse=True,
+            )[:5],
             "stages": self.events,
         }
         self.summary_path.write_text(
@@ -1448,9 +1583,9 @@ def main() -> None:
         raise FileNotFoundError(input_video)
     profiler = RuntimeProfiler(work_dir)
 
-    with profiler.stage("media_tools", method="environment_or_path_lookup"):
+    with profiler.stage("media_tools", method="environment_or_path_lookup", compute_device="cpu"):
         ffmpeg, ffprobe = resolve_ffmpeg_tools()
-    with profiler.stage("media_probe", method="ffprobe") as stage:
+    with profiler.stage("media_probe", method="ffprobe", compute_device="cpu") as stage:
         media = probe_media(input_video, ffprobe)
         stage.update(
             duration_seconds=round(media.duration, 6),
@@ -1461,16 +1596,22 @@ def main() -> None:
         )
     if not media.has_audio:
         raise ValueError("Prototype currently requires an input audio stream")
-    with profiler.stage("device_selection", method="cuda_capability_check") as stage:
+    with profiler.stage("device_selection", method="cuda_capability_check", compute_device="cpu") as stage:
         device = choose_device(args.device)
         stage.update(requested_device=args.device, selected_device=device)
     if args.device == "cuda" and device != "cuda":
         raise RuntimeError("CUDA was requested but is not available")
+    with profiler.stage("hardware_probe", method="python_platform_and_torch", compute_device="cpu"):
+        profiler.set_hardware(collect_hardware_info())
 
     analysis_wav = work_dir / "analysis-audio.wav"
-    with profiler.stage("audio_extraction", method="ffmpeg_pcm_s16le_16khz_mono"):
+    with profiler.stage(
+        "audio_extraction",
+        method="ffmpeg_pcm_s16le_16khz_mono",
+        compute_device="cpu",
+    ):
         extract_analysis_audio(input_video, analysis_wav, ffmpeg)
-    with profiler.stage("asr", requested_method=args.asr_backend) as stage:
+    with profiler.stage("asr", requested_method=args.asr_backend, compute_device=device) as stage:
         segments, words, asr_report = transcribe_audio(
             analysis_wav,
             args.asr_model,
@@ -1484,31 +1625,60 @@ def main() -> None:
             segments=len(segments),
             words=len(words),
         )
-    with profiler.stage("speech_gap_detection", method="word_intervals_padding_merge") as stage:
+    with profiler.stage(
+        "speech_gap_detection",
+        method="word_intervals_padding_merge",
+        compute_device="cpu",
+    ) as stage:
         speech = speech_intervals_from_words(words, media.duration)
         gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
         stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
 
-    with profiler.stage("shot_detection") as stage:
+    with profiler.stage("shot_detection", compute_device="cpu") as stage:
         shots = detect_shots(
             input_video,
             media.duration,
             threshold=args.shot_threshold,
             runtime_details=stage,
         )
-    with profiler.stage("shot_visual_features", method="opencv_hsv_histogram_and_motion"):
+    with profiler.stage(
+        "shot_visual_features",
+        method="opencv_hsv_histogram_and_motion",
+        compute_device="cpu",
+    ):
         histograms = sample_shot_features(input_video, shots, work_dir / "keyframes")
-    with profiler.stage("shot_audio_features", method="numpy_rms_and_fft_centroid"):
+    with profiler.stage(
+        "shot_audio_features",
+        method="numpy_rms_and_fft_centroid",
+        compute_device="cpu",
+    ):
         wav_features_by_shot(analysis_wav, shots)
-    with profiler.stage("transcript_shot_alignment", method="timestamp_overlap"):
+    with profiler.stage(
+        "transcript_shot_alignment",
+        method="timestamp_overlap",
+        compute_device="cpu",
+    ):
         attach_transcripts(shots, segments)
-    with profiler.stage("scene_segmentation", method="weighted_visual_audio_text_distance") as stage:
+    with profiler.stage(
+        "scene_segmentation",
+        method="weighted_visual_audio_text_distance",
+        compute_device="cpu",
+    ) as stage:
         scenes = segment_scenes(shots, histograms, boundary_threshold=args.scene_threshold)
         stage.update(boundary_threshold=args.scene_threshold, scenes=len(scenes))
 
-    with profiler.stage("visual_backend_initialization", method=args.visual_backend):
+    visual_compute_device = device if args.visual_backend == "qwen25" else "cpu"
+    with profiler.stage(
+        "visual_backend_initialization",
+        method=args.visual_backend,
+        compute_device=visual_compute_device,
+    ):
         backend = choose_backend(args.visual_backend, args.vlm_model, device)
-    with profiler.stage("ad_decisions", method=args.visual_backend) as stage:
+    with profiler.stage(
+        "ad_decisions",
+        method=args.visual_backend,
+        compute_device=visual_compute_device,
+    ) as stage:
         decisions = make_decisions(
             input_video,
             gaps,
@@ -1524,7 +1694,16 @@ def main() -> None:
             ad_decisions=sum(item.decision == "AD" for item in decisions),
             wait_decisions=sum(item.decision == "WAIT" for item in decisions),
         )
-    with profiler.stage("tts", requested_method=args.tts_backend) as stage:
+    tts_compute_device = (
+        device
+        if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
+        else "cpu"
+    )
+    with profiler.stage(
+        "tts",
+        requested_method=args.tts_backend,
+        compute_device=tts_compute_device,
+    ) as stage:
         tts_backend, decisions = synthesize_decisions(
             decisions,
             work_dir / "narration",
@@ -1536,10 +1715,11 @@ def main() -> None:
         )
         stage.update(
             method=tts_backend,
+            compute_device=device if tts_backend == "transformers" else "cpu",
             generated_cues=sum(bool(item.tts_path) for item in decisions),
         )
 
-    with profiler.stage("artifact_write", method="json_and_webvtt"):
+    with profiler.stage("artifact_write", method="json_and_webvtt", compute_device="cpu"):
         write_vtt(decisions, work_dir / "descriptions.vtt")
         write_json(work_dir / "media.json", asdict(media))
         write_json(
@@ -1558,12 +1738,16 @@ def main() -> None:
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
         write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
 
-    with profiler.stage("video_mix", method="ffmpeg_filter_complex_audio_mix"):
+    with profiler.stage(
+        "video_mix",
+        method="ffmpeg_filter_complex_audio_mix",
+        compute_device="cpu",
+    ):
         mix_described_video(input_video, output_video, decisions, ffmpeg)
-    with profiler.stage("output_validation", method="ffmpeg_full_decode"):
+    with profiler.stage("output_validation", method="ffmpeg_full_decode", compute_device="cpu"):
         validate_decode(output_video, ffmpeg)
     elapsed = time.perf_counter() - started
-    with profiler.stage("evaluation", method="internal_metrics"):
+    with profiler.stage("evaluation", method="internal_metrics", compute_device="cpu"):
         report = {
             "input": str(input_video),
             "output": str(output_video),
