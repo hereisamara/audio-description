@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -25,6 +26,31 @@ from typing import Any, Iterable, Sequence
 
 import cv2
 import numpy as np
+
+
+LOGGER = logging.getLogger("offline_ad_poc")
+
+
+def configure_logging(work_dir: Path) -> Path:
+    """Write readable runtime decisions to both the console and work directory."""
+    log_path = work_dir / "runtime.log"
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    for handler in list(LOGGER.handlers):
+        handler.close()
+        LOGGER.removeHandler(handler)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(console)
+    LOGGER.addHandler(file_handler)
+    LOGGER.info("runtime_log path=%s", log_path)
+    return log_path
 
 
 @dataclass
@@ -118,6 +144,7 @@ def resolve_ffmpeg_tools() -> tuple[str, str]:
     ffmpeg = os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg")
     ffprobe = os.environ.get("FFPROBE_BINARY") or shutil.which("ffprobe")
     if ffmpeg and ffprobe:
+        LOGGER.info("method stage=media_tools ffmpeg=%s ffprobe=%s", ffmpeg, ffprobe)
         return ffmpeg, ffprobe
     raise RuntimeError(
         "FFmpeg/ffprobe not found. Install the Conda ffmpeg package or set "
@@ -184,13 +211,16 @@ def extract_analysis_audio(input_video: Path, output_wav: Path, ffmpeg: str) -> 
 
 def choose_device(requested: str) -> str:
     if requested == "cpu":
+        LOGGER.info("method stage=device_selection requested=cpu selected=cpu reason=explicit_request")
         return "cpu"
     cuda_available = False
+    detection_method = "none"
     try:
         import ctranslate2
 
         if ctranslate2.get_cuda_device_count() > 0:
             cuda_available = True
+            detection_method = "ctranslate2"
     except Exception:
         pass
     if not cuda_available:
@@ -198,11 +228,24 @@ def choose_device(requested: str) -> str:
             import torch
 
             cuda_available = torch.cuda.is_available()
+            detection_method = "torch" if cuda_available else "torch_no_cuda"
         except Exception:
             pass
     if requested == "cuda" and not cuda_available:
+        LOGGER.warning(
+            "fallback stage=device_selection requested=cuda selected=cpu "
+            "reason=cuda_unavailable detection_method=%s",
+            detection_method,
+        )
         return "cpu"
-    return "cuda" if cuda_available else "cpu"
+    selected = "cuda" if cuda_available else "cpu"
+    LOGGER.info(
+        "method stage=device_selection requested=%s selected=%s detection_method=%s",
+        requested,
+        selected,
+        detection_method,
+    )
+    return selected
 
 
 def _segments_from_words(words: Sequence[Word], maximum_pause: float = 0.8) -> list[TranscriptSegment]:
@@ -349,21 +392,29 @@ def transcribe_audio(
 ) -> tuple[list[TranscriptSegment], list[Word], dict[str, Any]]:
     if backend in {"auto", "faster-whisper"}:
         try:
-            return _transcribe_faster_whisper(
+            result = _transcribe_faster_whisper(
                 audio_path,
                 model_name_or_path,
                 device,
                 allow_model_download,
             )
+            LOGGER.info("method stage=asr backend=faster-whisper device=%s", device)
+            return result
         except (ImportError, RuntimeError) as exc:
             if backend == "faster-whisper" or "Install faster-whisper" not in str(exc):
                 raise
-    return _transcribe_transformers_whisper(
+            LOGGER.warning(
+                "fallback stage=asr from=faster-whisper to=transformers reason=%s",
+                str(exc).replace("\n", " "),
+            )
+    result = _transcribe_transformers_whisper(
         audio_path,
         model_name_or_path,
         device,
         allow_model_download,
     )
+    LOGGER.info("method stage=asr backend=transformers-whisper device=%s", device)
+    return result
 
 
 def merge_intervals(intervals: Sequence[Interval], maximum_gap: float = 0.45) -> list[Interval]:
@@ -416,25 +467,8 @@ def build_gaps(
     return gaps
 
 
-def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> list[Shot]:
-    try:
-        from scenedetect import ContentDetector, detect
-    except ImportError:
-        ContentDetector = None
-        detect = None
-
-    if ContentDetector is not None and detect is not None:
-        scene_list = detect(str(video_path), ContentDetector(threshold=threshold), show_progress=False)
-        if not scene_list:
-            return [Shot(1, 0.0, duration)]
-        shots = [
-            Shot(index, float(start.get_seconds()), min(duration, float(end.get_seconds())))
-            for index, (start, end) in enumerate(scene_list, start=1)
-        ]
-        if shots and shots[-1].end < duration:
-            shots[-1].end = duration
-        return shots
-
+def _detect_shots_opencv(video_path: Path, duration: float, threshold: float) -> list[Shot]:
+    """Fallback content-difference detector that requires only OpenCV."""
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"OpenCV could not open {video_path}")
@@ -458,11 +492,60 @@ def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> 
     finally:
         capture.release()
     boundaries.append(duration)
-    return [
+    shots = [
         Shot(index, start, end)
         for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), start=1)
         if end - start > 0.05
     ] or [Shot(1, 0.0, duration)]
+    LOGGER.info(
+        "method stage=shot_detection backend=opencv_frame_difference threshold=%.3f shots=%d",
+        threshold,
+        len(shots),
+    )
+    return shots
+
+
+def detect_shots(video_path: Path, duration: float, threshold: float = 27.0) -> list[Shot]:
+    try:
+        from scenedetect import ContentDetector, detect
+    except ImportError as exc:
+        LOGGER.warning(
+            "fallback stage=shot_detection from=scenedetect.ContentDetector "
+            "to=opencv_frame_difference reason=%s",
+            str(exc).replace("\n", " "),
+        )
+        return _detect_shots_opencv(video_path, duration, threshold)
+
+    try:
+        scene_list = detect(str(video_path), ContentDetector(threshold=threshold), show_progress=False)
+    except Exception as exc:
+        LOGGER.warning(
+            "fallback stage=shot_detection from=scenedetect.ContentDetector "
+            "to=opencv_frame_difference reason=%s:%s",
+            type(exc).__name__,
+            str(exc).replace("\n", " "),
+        )
+        return _detect_shots_opencv(video_path, duration, threshold)
+    else:
+        if not scene_list:
+            LOGGER.info(
+                "method stage=shot_detection backend=scenedetect.ContentDetector "
+                "threshold=%.3f shots=1 no_boundaries=true",
+                threshold,
+            )
+            return [Shot(1, 0.0, duration)]
+        shots = [
+            Shot(index, float(start.get_seconds()), min(duration, float(end.get_seconds())))
+            for index, (start, end) in enumerate(scene_list, start=1)
+        ]
+        if shots and shots[-1].end < duration:
+            shots[-1].end = duration
+        LOGGER.info(
+            "method stage=shot_detection backend=scenedetect.ContentDetector threshold=%.3f shots=%d",
+            threshold,
+            len(shots),
+        )
+        return shots
 
 
 def frame_at(capture: cv2.VideoCapture, seconds: float) -> np.ndarray | None:
@@ -849,10 +932,12 @@ def limit_words(text: str, maximum: int) -> str:
 
 def choose_backend(name: str, model_path: str | None, device: str) -> VisualBackend:
     if name == "heuristic":
+        LOGGER.info("method stage=visual_backend backend=heuristic device=cpu")
         return HeuristicBackend()
     if name == "qwen25":
         if not model_path:
             raise ValueError("--vlm-model is required for --visual-backend qwen25")
+        LOGGER.info("method stage=visual_backend backend=qwen2.5-vl device=%s", device)
         return Qwen25Backend(model_path, device)
     raise ValueError(f"Unknown visual backend: {name}")
 
@@ -924,11 +1009,14 @@ def resolve_tts_backend(
     candidates = [requested] if requested != "auto" else ["transformers", "piper", "espeak-ng", "say"]
     for candidate in candidates:
         if candidate == "transformers" and transformers_model:
+            LOGGER.info("method stage=tts backend=transformers-vits device=pipeline_device")
             return candidate, transformers_model
         executable = shutil.which(candidate)
         if candidate == "piper" and executable and piper_model:
+            LOGGER.info("method stage=tts backend=piper device=cpu")
             return candidate, executable
         if candidate in {"espeak-ng", "say"} and executable:
+            LOGGER.info("method stage=tts backend=%s device=cpu", candidate)
             return candidate, executable
     raise RuntimeError(
         "No offline TTS backend found. Supply --tts-model for Conda-native Transformers TTS, "
@@ -1239,6 +1327,17 @@ def main() -> None:
     output_video = args.output_video.resolve()
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(work_dir)
+    LOGGER.info(
+        "pipeline_start input=%s output=%s requested_device=%s asr_backend=%s "
+        "visual_backend=%s tts_backend=%s",
+        input_video,
+        output_video,
+        args.device,
+        args.asr_backend,
+        args.visual_backend,
+        args.tts_backend,
+    )
     if not input_video.exists():
         raise FileNotFoundError(input_video)
 
