@@ -996,6 +996,9 @@ class VisualBackend:
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def runtime_metrics(self) -> dict[str, Any]:
+        return {}
+
 
 class HeuristicBackend(VisualBackend):
     """A deterministic media-pipeline test, not a semantic AD model."""
@@ -1091,6 +1094,14 @@ class Qwen25Backend(VisualBackend):
             local_files_only=True,
             use_fast=False,
         )
+        self.processed_image_grids: list[list[list[int]]] = []
+        self.vision_tokens = 0
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        return {
+            "qwen_image_grid_thw": self.processed_image_grids,
+            "qwen_vision_tokens": self.vision_tokens,
+        }
 
     def decide(
         self,
@@ -1133,11 +1144,17 @@ class Qwen25Backend(VisualBackend):
                 self.model.config.vision_config.spatial_merge_size,
             )
         )
+        image_grid_list = image_grid_thw.tolist()
+        self.processed_image_grids.append(image_grid_list)
+        self.vision_tokens += sum(
+            math.prod(int(value) for value in grid) // (merge_size**2)
+            for grid in image_grid_list
+        )
         image_token = getattr(self.tokenizer, "image_token", "<|image_pad|>")
         chat_text = expand_qwen_image_tokens(
             chat_text,
             image_token,
-            image_grid_thw.tolist(),
+            image_grid_list,
             merge_size,
         )
         text_features = self.tokenizer([chat_text], padding=True, return_tensors="pt")
@@ -1728,6 +1745,7 @@ def main() -> None:
             processed_gaps=len(decisions),
             ad_decisions=sum(item.decision == "AD" for item in decisions),
             wait_decisions=sum(item.decision == "WAIT" for item in decisions),
+            **backend.runtime_metrics(),
         )
     tts_compute_device = (
         device
