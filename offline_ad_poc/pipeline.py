@@ -932,12 +932,30 @@ def segment_scenes(
     return scenes
 
 
+def resize_frame_max_edge(frame: np.ndarray, max_edge: int | None) -> np.ndarray:
+    if max_edge is None or max_edge <= 0:
+        return frame
+    height, width = frame.shape[:2]
+    longest_edge = max(width, height)
+    if longest_edge <= max_edge:
+        return frame
+    scale = max_edge / longest_edge
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    return cv2.resize(
+        frame,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def sample_window_frames(
     video_path: Path,
     start: float,
     end: float,
     output_dir: Path,
     count: int = 4,
+    max_edge: int | None = None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(video_path))
@@ -950,6 +968,7 @@ def sample_window_frames(
             frame = frame_at(capture, float(timestamp))
             if frame is None:
                 continue
+            frame = resize_frame_max_edge(frame, max_edge)
             path = output_dir / f"frame-{index:02d}-{timestamp:.2f}.jpg"
             cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
             paths.append(path)
@@ -1192,6 +1211,7 @@ def make_decisions(
     backend: VisualBackend,
     frame_root: Path,
     maximum_gaps: int,
+    evidence_max_edge: int | None = None,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
@@ -1203,6 +1223,7 @@ def make_decisions(
             float(context["window_end"]),
             frame_root / f"gap-{index:03d}",
             count=4,
+            max_edge=evidence_max_edge,
         )
         try:
             payload = backend.decide(
@@ -1556,6 +1577,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
+    parser.add_argument(
+        "--evidence-max-edge",
+        type=int,
+        default=0,
+        help=(
+            "Downscale VLM evidence frames so their longest edge is at most this many pixels; "
+            "0 preserves the source resolution"
+        ),
+    )
     parser.add_argument("--shot-threshold", type=float, default=27.0)
     parser.add_argument("--scene-threshold", type=float, default=0.52)
     return parser.parse_args()
@@ -1563,6 +1593,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.evidence_max_edge < 0:
+        raise ValueError("--evidence-max-edge must be zero or a positive integer")
     started = time.perf_counter()
     input_video = args.input.resolve()
     output_video = args.output_video.resolve()
@@ -1678,6 +1710,8 @@ def main() -> None:
         "ad_decisions",
         method=args.visual_backend,
         compute_device=visual_compute_device,
+        evidence_max_edge=args.evidence_max_edge or "source",
+        evidence_frames_per_gap=4,
     ) as stage:
         decisions = make_decisions(
             input_video,
@@ -1688,6 +1722,7 @@ def main() -> None:
             backend,
             work_dir / "evidence-frames",
             args.maximum_gaps,
+            args.evidence_max_edge or None,
         )
         stage.update(
             processed_gaps=len(decisions),

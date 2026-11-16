@@ -20,6 +20,7 @@ from offline_ad_poc.pipeline import (
     expand_qwen_image_tokens,
     limit_words,
     merge_intervals,
+    resize_frame_max_edge,
     segment_scenes,
     speech_intervals_from_words,
 )
@@ -82,6 +83,14 @@ class PipelineUnitTests(unittest.TestCase):
             merge_size=2,
         )
         self.assertEqual(expanded.count("<|image_pad|>"), 6)
+
+    def test_evidence_frame_resize_preserves_aspect_ratio_without_upscaling(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        resized = resize_frame_max_edge(frame, 320)
+        unchanged = resize_frame_max_edge(frame, 1280)
+
+        self.assertEqual(resized.shape, (240, 320, 3))
+        self.assertIs(unchanged, frame)
 
     def test_runtime_profiler_writes_stage_events_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
