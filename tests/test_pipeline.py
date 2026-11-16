@@ -5,12 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from offline_ad_poc.pipeline import (
     Gap,
     Interval,
+    Decision,
     RuntimeProfiler,
     Shot,
     Word,
@@ -20,6 +22,7 @@ from offline_ad_poc.pipeline import (
     expand_qwen_image_tokens,
     limit_words,
     merge_intervals,
+    mix_described_video,
     resize_frame_max_edge,
     segment_scenes,
     speech_intervals_from_words,
@@ -91,6 +94,29 @@ class PipelineUnitTests(unittest.TestCase):
 
         self.assertEqual(resized.shape, (240, 320, 3))
         self.assertIs(unchanged, frame)
+
+    @patch("offline_ad_poc.pipeline.run_command")
+    def test_wait_only_output_copies_original_streams(self, run_command) -> None:
+        decision = Decision(
+            gap_start=1.0,
+            gap_end=3.0,
+            decision="WAIT",
+            description="",
+            reason="no important visual change",
+            importance=0.1,
+            word_budget=4,
+        )
+        method = mix_described_video(
+            Path("input.mp4"),
+            Path("output.mp4"),
+            [decision],
+            "ffmpeg",
+        )
+
+        self.assertEqual(method, "ffmpeg_stream_copy_no_ad")
+        command = run_command.call_args.args[0]
+        self.assertIn("copy", command)
+        self.assertNotIn("-filter_complex", command)
 
     def test_runtime_profiler_writes_stage_events_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

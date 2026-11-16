@@ -1450,10 +1450,34 @@ def mix_described_video(
     output_video: Path,
     decisions: Sequence[Decision],
     ffmpeg: str,
-) -> None:
+) -> str:
     active = [decision for decision in decisions if decision.decision == "AD" and decision.tts_path]
     if not active:
-        raise RuntimeError("No accepted AD events to mix")
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(input_video),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_video),
+            ]
+        )
+        LOGGER.info(
+            "method stage=video_mix backend=ffmpeg_stream_copy reason=no_accepted_ad_events"
+        )
+        return "ffmpeg_stream_copy_no_ad"
     args: list[str] = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(input_video)]
     for decision in active:
         args.extend(["-i", decision.tts_path])
@@ -1520,6 +1544,7 @@ def mix_described_video(
         ]
     )
     run_command(args)
+    return "ffmpeg_filter_complex_audio_mix"
 
 
 def validate_decode(output_video: Path, ffmpeg: str) -> None:
@@ -1791,12 +1816,8 @@ def main() -> None:
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
         write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
 
-    with profiler.stage(
-        "video_mix",
-        method="ffmpeg_filter_complex_audio_mix",
-        compute_device="cpu",
-    ):
-        mix_described_video(input_video, output_video, decisions, ffmpeg)
+    with profiler.stage("video_mix", compute_device="cpu") as stage:
+        stage["method"] = mix_described_video(input_video, output_video, decisions, ffmpeg)
     with profiler.stage("output_validation", method="ffmpeg_full_decode", compute_device="cpu"):
         validate_decode(output_video, ffmpeg)
     elapsed = time.perf_counter() - started
