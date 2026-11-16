@@ -270,7 +270,53 @@ their wall time includes completed GPU work. They do not continuously sample
 GPU utilization; use the Slurm job's monitoring facilities or NVIDIA tooling
 if utilization-over-time traces are required later.
 
-## 8. Tests
+## 8. Compare VLM evidence resolutions
+
+The resolution sweep runs the same video at four evidence-frame sizes while
+keeping the model, four-frame sampling, prompt, audio, and pipeline parameters
+fixed. For a 640x480 source, the defaults test long edges of 160, 320, 480,
+and 640 pixels. The sampler never upscales a source frame, so do not add 720 or
+1080 to a 640x480 source: those settings cannot add visual information.
+
+Submit one sequential four-run job:
+
+```bash
+sbatch scripts/submit_lanta_resolution_sweep.sh \
+  "$PWD/inputs/real-scene-01.mp4" \
+  "$PWD/outputs/resolution-sweep-real-scene-01-v1"
+```
+
+Override the tested long-edge values when the source video has a different
+native resolution:
+
+```bash
+RESOLUTIONS="240 360 540 720 1080" \
+sbatch scripts/submit_lanta_resolution_sweep.sh \
+  "$PWD/inputs/example-1080p.mp4" \
+  "$PWD/outputs/resolution-sweep-example-1080p-v1"
+```
+
+Each run has its own final video, work artifacts, and runtime logs. The job
+also writes `resolution-comparison.csv` and `resolution-comparison.json` with:
+
+- total, VLM initialization, VLM decision, and TTS times;
+- VLM-stage CUDA peak allocation and Qwen visual-token count;
+- AD/WAIT decisions and generated descriptions;
+- speedup, decision agreement, and description-token overlap relative to the
+  largest tested resolution;
+- an empty `manual_quality_score_1_to_5` column for human review.
+
+Description-token overlap measures output stability, not semantic correctness.
+Choose the smallest resolution whose descriptions retain the important visible
+actions and details when compared with the source video and any human AD ground
+truth. Inspect the report after completion with:
+
+```bash
+column -s, -t \
+  outputs/resolution-sweep-real-scene-01-v1/resolution-comparison.csv | less -S
+```
+
+## 9. Tests
 
 ```bash
 python -m unittest discover -s tests -v
