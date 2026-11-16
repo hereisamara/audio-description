@@ -272,6 +272,35 @@ if utilization-over-time traces are required later.
 
 ## 8. Compare VLM evidence resolutions
 
+For the lowest-risk first experiment, benchmark only Qwen2.5-VL with one fixed
+video frame. This path does not load Whisper or TTS, does not create output
+videos, and runs every resolution sequentially with one Qwen model on one GPU:
+
+```bash
+sbatch scripts/submit_lanta_vlm_frame_sweep.sh \
+  "$PWD/inputs/real-scene-01.mp4" \
+  "$PWD/outputs/vlm-frame-sweep-real-scene-01-v1"
+```
+
+The default frame is at 31.72 seconds and the default long-edge resolutions are
+160, 320, 480, and 640 pixels. Override them without editing the script:
+
+```bash
+FRAME_TIMESTAMP=31.72 RESOLUTIONS="160 320 480 640" \
+sbatch scripts/submit_lanta_vlm_frame_sweep.sh \
+  "$PWD/inputs/real-scene-01.mp4" \
+  "$PWD/outputs/vlm-frame-sweep-real-scene-01-v2"
+```
+
+The output directory contains the exact image tested at every resolution plus
+`vlm-frame-resolution-results.csv` and `vlm-frame-resolution-results.json`.
+They record model initialization separately from each inference, Qwen visual
+tokens, synchronized wall time, peak and incremental GPU allocation, and the
+complete AD/WAIT result. Use this isolated benchmark before the full pipeline
+sweep below.
+
+### Full-pipeline resolution sweep
+
 The resolution sweep runs the same video at four evidence-frame sizes while
 keeping the model, four-frame sampling, prompt, audio, and pipeline parameters
 fixed. For a 640x480 source, the defaults test long edges of 160, 320, 480,
