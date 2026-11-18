@@ -296,8 +296,12 @@ The output directory contains the exact image tested at every resolution plus
 `vlm-frame-resolution-results.csv` and `vlm-frame-resolution-results.json`.
 They record model initialization separately from each inference, Qwen visual
 tokens, synchronized wall time, peak and incremental GPU allocation, and the
-complete AD/WAIT result. Use this isolated benchmark before the full pipeline
-sweep below.
+complete AD/WAIT result. One excluded warm-up inference at each resolution
+removes first-use and input-shape overhead, and the reported time is the median
+of three sequential measured inferences per resolution. The report also flags
+an `AD` response with an empty description as invalid and records whether
+repeated outputs were consistent. Use this isolated benchmark before the full
+pipeline sweep below.
 
 ### Full-pipeline resolution sweep
 
