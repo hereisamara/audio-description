@@ -232,6 +232,14 @@ and compute resources for each pipeline stage. The work directory contains:
 - `evaluation-report.json`: quality metrics plus paths to the three runtime
   profiling files.
 
+Whisper timestamps are validated before they become dialogue intervals. Zero or
+near-zero word spans and implausibly stretched words are excluded from gap
+detection, while the unmodified ASR output remains in `transcript.json` under
+`raw_segments` and `raw_words`. The filtered output is stored under `segments`
+and `words`, and `dialogue-validation.json` records rejection counts and
+thresholds. Use `--dialogue-filter none` only to reproduce the legacy behavior;
+adjust `--maximum-word-duration` when evaluating a different ASR model.
+
 Method lines make optional fallbacks explicit. For example, because
 PySceneDetect is not part of the minimal Conda environments, the normal log is:
 

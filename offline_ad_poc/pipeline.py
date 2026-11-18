@@ -649,6 +649,45 @@ def speech_intervals_from_words(
     return merge_intervals(raw, maximum_gap=merge_gap)
 
 
+def validate_whisper_word_timestamps(
+    words: Sequence[Word],
+    minimum_duration: float = 0.03,
+    maximum_duration: float = 2.50,
+) -> tuple[list[Word], dict[str, Any]]:
+    """Remove unusable Whisper alignments before they can become dialogue intervals."""
+    validated: list[Word] = []
+    rejected_nonpositive = 0
+    rejected_stretched = 0
+    for word in words:
+        duration = word.end - word.start
+        if duration < minimum_duration:
+            rejected_nonpositive += 1
+            continue
+        if duration > maximum_duration:
+            rejected_stretched += 1
+            continue
+        validated.append(word)
+    report = {
+        "method": "whisper_word_duration_validation",
+        "minimum_word_duration": minimum_duration,
+        "maximum_word_duration": maximum_duration,
+        "raw_words": len(words),
+        "validated_words": len(validated),
+        "rejected_words": len(words) - len(validated),
+        "rejected_nonpositive_duration": rejected_nonpositive,
+        "rejected_stretched_duration": rejected_stretched,
+    }
+    LOGGER.info(
+        "method stage=dialogue_timestamp_validation backend=whisper_word_duration "
+        "raw_words=%d validated_words=%d rejected_nonpositive=%d rejected_stretched=%d",
+        len(words),
+        len(validated),
+        rejected_nonpositive,
+        rejected_stretched,
+    )
+    return validated, report
+
+
 def build_gaps(
     speech: Sequence[Interval],
     duration: float,
@@ -1620,6 +1659,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
     parser.add_argument(
+        "--dialogue-filter",
+        choices=["timestamp", "none"],
+        default="timestamp",
+        help="Validate Whisper word durations before treating timestamps as dialogue",
+    )
+    parser.add_argument("--maximum-word-duration", type=float, default=2.5)
+    parser.add_argument(
         "--evidence-max-edge",
         type=int,
         default=0,
@@ -1686,7 +1732,7 @@ def main() -> None:
     ):
         extract_analysis_audio(input_video, analysis_wav, ffmpeg)
     with profiler.stage("asr", requested_method=args.asr_backend, compute_device=device) as stage:
-        segments, words, asr_report = transcribe_audio(
+        raw_segments, raw_words, asr_report = transcribe_audio(
             analysis_wav,
             args.asr_model,
             device,
@@ -1696,12 +1742,37 @@ def main() -> None:
         stage.update(
             method=asr_report["backend"],
             model=asr_report["model"],
-            segments=len(segments),
-            words=len(words),
+            segments=len(raw_segments),
+            words=len(raw_words),
+        )
+    if args.dialogue_filter == "timestamp":
+        with profiler.stage(
+            "dialogue_timestamp_validation",
+            method="whisper_word_duration_validation",
+            compute_device="cpu",
+        ) as stage:
+            words, dialogue_validation_report = validate_whisper_word_timestamps(
+                raw_words,
+                maximum_duration=args.maximum_word_duration,
+            )
+            segments = _segments_from_words(words)
+            stage.update(**dialogue_validation_report)
+    else:
+        dialogue_validation_report = {
+            "method": "none",
+            "raw_words": len(raw_words),
+            "validated_words": len(raw_words),
+            "rejected_words": 0,
+        }
+        words = list(raw_words)
+        segments = list(raw_segments)
+        LOGGER.warning(
+            "fallback stage=dialogue_timestamp_validation backend=none "
+            "reason=unvalidated_whisper_word_timestamps_requested"
         )
     with profiler.stage(
         "speech_gap_detection",
-        method="word_intervals_padding_merge",
+        method="validated_word_intervals_padding_merge",
         compute_device="cpu",
     ) as stage:
         speech = speech_intervals_from_words(words, media.duration)
@@ -1803,11 +1874,20 @@ def main() -> None:
         write_json(
             work_dir / "transcript.json",
             {
-                "report": asr_report,
+                "report": {
+                    **asr_report,
+                    "raw_segments": len(raw_segments),
+                    "raw_words": len(raw_words),
+                    "validated_segments": len(segments),
+                    "validated_words": len(words),
+                },
                 "segments": [asdict(x) for x in segments],
                 "words": [asdict(x) for x in words],
+                "raw_segments": [asdict(x) for x in raw_segments],
+                "raw_words": [asdict(x) for x in raw_words],
             },
         )
+        write_json(work_dir / "dialogue-validation.json", dialogue_validation_report)
         write_json(
             work_dir / "speech-and-gaps.json",
             {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]},

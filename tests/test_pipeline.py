@@ -26,6 +26,7 @@ from offline_ad_poc.pipeline import (
     resize_frame_max_edge,
     segment_scenes,
     speech_intervals_from_words,
+    validate_whisper_word_timestamps,
 )
 
 
@@ -47,6 +48,18 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertGreater(gaps[0].start, 2.0)
         self.assertLess(gaps[0].end, 6.0)
         self.assertGreater(gaps[0].word_budget, 0)
+
+    def test_invalid_whisper_word_durations_are_rejected(self) -> None:
+        words = [
+            Word(1.0, 1.4, "real"),
+            Word(2.0, 2.0, "zero"),
+            Word(5.0, 15.0, "stretched"),
+        ]
+        validated, report = validate_whisper_word_timestamps(words)
+
+        self.assertEqual(validated, [words[0]])
+        self.assertEqual(report["rejected_nonpositive_duration"], 1)
+        self.assertEqual(report["rejected_stretched_duration"], 1)
 
     def test_limit_words_respects_budget(self) -> None:
         text = limit_words("one two three four five six", 4)
@@ -105,6 +118,7 @@ class PipelineUnitTests(unittest.TestCase):
             reason="no important visual change",
             importance=0.1,
             word_budget=4,
+            evidence_frames=[],
         )
         method = mix_described_video(
             Path("input.mp4"),
