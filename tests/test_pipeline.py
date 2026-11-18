@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import cv2
 
 from offline_ad_poc.pipeline import (
     Gap,
@@ -16,6 +17,7 @@ from offline_ad_poc.pipeline import (
     RuntimeProfiler,
     Shot,
     Word,
+    _detect_shots_opencv,
     _segments_from_words,
     _whisper_generate_kwargs,
     build_gaps,
@@ -27,6 +29,7 @@ from offline_ad_poc.pipeline import (
     segment_scenes,
     speech_intervals_from_words,
     validate_whisper_word_timestamps,
+    validate_shot_timeline,
 )
 
 
@@ -73,6 +76,37 @@ class PipelineUnitTests(unittest.TestCase):
         second[1] = 1
         scenes = segment_scenes(shots, [first, second], boundary_threshold=0.5)
         self.assertEqual(len(scenes), 2)
+
+    def test_shot_timeline_validation_checks_coverage_and_continuity(self) -> None:
+        valid = validate_shot_timeline([Shot(1, 0.0, 2.0), Shot(2, 2.0, 5.0)], 5.0)
+        invalid = validate_shot_timeline([Shot(1, 0.2, 2.0), Shot(2, 2.4, 4.0)], 5.0)
+
+        self.assertTrue(valid["valid_timeline"])
+        self.assertFalse(invalid["valid_timeline"])
+        self.assertIn("timeline_does_not_start_at_zero", invalid["warnings"])
+        self.assertIn("gap_before_shot_2", invalid["warnings"])
+
+    def test_opencv_shot_detector_finds_a_hard_cut(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "hard-cut.avi"
+            writer = cv2.VideoWriter(
+                str(video_path),
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                10.0,
+                (64, 48),
+            )
+            self.assertTrue(writer.isOpened())
+            try:
+                for value in (0,) * 10 + (255,) * 10:
+                    writer.write(np.full((48, 64, 3), value, dtype=np.uint8))
+            finally:
+                writer.release()
+
+            shots = _detect_shots_opencv(video_path, duration=2.0, threshold=20.0)
+
+        self.assertEqual(len(shots), 2)
+        self.assertAlmostEqual(shots[0].end, 1.0, places=1)
+        self.assertAlmostEqual(shots[1].start, 1.0, places=1)
 
     def test_merge_intervals_keeps_distant_regions_separate(self) -> None:
         merged = merge_intervals([Interval(0, 1), Interval(1.2, 2), Interval(4, 5)], maximum_gap=0.3)

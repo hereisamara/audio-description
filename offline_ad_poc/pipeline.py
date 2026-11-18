@@ -841,6 +841,190 @@ def normalized_histogram(frame: np.ndarray) -> np.ndarray:
     return hist / norm if norm else hist
 
 
+def validate_shot_timeline(shots: Sequence[Shot], duration: float) -> dict[str, Any]:
+    warnings: list[str] = []
+    if not shots:
+        warnings.append("no_shots")
+    else:
+        if abs(shots[0].start) > 0.05:
+            warnings.append("timeline_does_not_start_at_zero")
+        if abs(shots[-1].end - duration) > 0.05:
+            warnings.append("timeline_does_not_end_at_media_duration")
+        for previous, current in zip(shots, shots[1:]):
+            difference = current.start - previous.end
+            if difference > 0.05:
+                warnings.append(f"gap_before_shot_{current.shot_id}")
+            elif difference < -0.05:
+                warnings.append(f"overlap_before_shot_{current.shot_id}")
+        for shot in shots:
+            if shot.end <= shot.start:
+                warnings.append(f"nonpositive_duration_shot_{shot.shot_id}")
+    durations = [shot.end - shot.start for shot in shots]
+    return {
+        "valid_timeline": not warnings,
+        "warnings": warnings,
+        "shots": len(shots),
+        "boundaries": max(0, len(shots) - 1),
+        "minimum_shot_duration": round(min(durations), 6) if durations else None,
+        "maximum_shot_duration": round(max(durations), 6) if durations else None,
+    }
+
+
+def create_shot_boundary_evidence(
+    video_path: Path,
+    shots: Sequence[Shot],
+    output_dir: Path,
+    duration: float,
+    offset_seconds: float = 0.15,
+) -> dict[str, Any]:
+    """Save independent before/after evidence for every detected boundary."""
+    report = validate_shot_timeline(shots, duration)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path}")
+    evidence: list[dict[str, Any]] = []
+    try:
+        for index, shot in enumerate(shots[1:], start=1):
+            boundary = shot.start
+            before_time = max(0.0, boundary - offset_seconds)
+            after_time = min(duration, boundary + offset_seconds)
+            before = frame_at(capture, before_time)
+            after = frame_at(capture, after_time)
+            if before is None or after is None:
+                evidence.append(
+                    {
+                        "boundary_index": index,
+                        "timestamp": boundary,
+                        "error": "frame_decode_failed",
+                    }
+                )
+                continue
+            before_small = cv2.resize(before, (320, 240))
+            after_small = cv2.resize(after, (320, 240))
+            before_gray = cv2.cvtColor(before_small, cv2.COLOR_BGR2GRAY)
+            after_gray = cv2.cvtColor(after_small, cv2.COLOR_BGR2GRAY)
+            pixel_difference = float(np.mean(cv2.absdiff(before_gray, after_gray)))
+            histogram_difference = float(
+                1.0 - np.clip(np.dot(normalized_histogram(before_small), normalized_histogram(after_small)), 0, 1)
+            )
+            cv2.putText(
+                before_small,
+                f"BEFORE {before_time:.2f}s",
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                after_small,
+                f"AFTER {after_time:.2f}s",
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            image_path = output_dir / f"boundary-{index:03d}-{boundary:.3f}.jpg"
+            cv2.imwrite(str(image_path), cv2.hconcat([before_small, after_small]))
+            evidence.append(
+                {
+                    "boundary_index": index,
+                    "timestamp": round(boundary, 6),
+                    "before": round(before_time, 6),
+                    "after": round(after_time, 6),
+                    "pixel_difference": round(pixel_difference, 4),
+                    "histogram_difference": round(histogram_difference, 6),
+                    "evidence_image": str(image_path),
+                }
+            )
+    finally:
+        capture.release()
+    soft_capture = cv2.VideoCapture(str(video_path))
+    if not soft_capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path}")
+    fps = soft_capture.get(cv2.CAP_PROP_FPS) or 25.0
+    previous: np.ndarray | None = None
+    frame_index = 0
+    scored_candidates: list[tuple[float, float]] = []
+    try:
+        while True:
+            ok, frame = soft_capture.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                score = float(np.mean(cv2.absdiff(previous, gray)))
+                timestamp = frame_index / fps
+                if score >= 10.0:
+                    scored_candidates.append((score, timestamp))
+            previous = gray
+            frame_index += 1
+    finally:
+        soft_capture.release()
+    detected_boundaries = [shot.start for shot in shots[1:]]
+    selected_candidates: list[tuple[float, float]] = []
+    for score, timestamp in sorted(scored_candidates, reverse=True):
+        if any(abs(timestamp - boundary) < 0.45 for boundary in detected_boundaries):
+            continue
+        if any(abs(timestamp - selected_time) < 0.60 for _, selected_time in selected_candidates):
+            continue
+        selected_candidates.append((score, timestamp))
+        if len(selected_candidates) >= 24:
+            break
+    candidate_dir = output_dir / "soft-candidates"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidate_capture = cv2.VideoCapture(str(video_path))
+    if not candidate_capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path}")
+    soft_evidence: list[dict[str, Any]] = []
+    try:
+        for index, (score, timestamp) in enumerate(
+            sorted(selected_candidates, key=lambda item: item[1]),
+            start=1,
+        ):
+            before_time = max(0.0, timestamp - offset_seconds)
+            after_time = min(duration, timestamp + offset_seconds)
+            before = frame_at(candidate_capture, before_time)
+            after = frame_at(candidate_capture, after_time)
+            item: dict[str, Any] = {
+                "candidate_index": index,
+                "timestamp": round(timestamp, 6),
+                "frame_difference_score": round(score, 4),
+            }
+            if before is not None and after is not None:
+                before_small = cv2.resize(before, (320, 240))
+                after_small = cv2.resize(after, (320, 240))
+                image_path = candidate_dir / f"candidate-{index:03d}-{timestamp:.3f}.jpg"
+                cv2.imwrite(str(image_path), cv2.hconcat([before_small, after_small]))
+                item["evidence_image"] = str(image_path)
+            else:
+                item["error"] = "frame_decode_failed"
+            soft_evidence.append(item)
+    finally:
+        candidate_capture.release()
+    report["evidence"] = evidence
+    report["decoded_boundaries"] = sum("error" not in item for item in evidence)
+    report["evidence_complete"] = report["decoded_boundaries"] == report["boundaries"]
+    report["validation_passed"] = report["valid_timeline"] and report["evidence_complete"]
+    report["soft_candidates_requiring_review"] = soft_evidence
+    report["soft_candidate_count"] = len(soft_evidence)
+    LOGGER.info(
+        "method stage=shot_boundary_validation backend=before_after_evidence "
+        "boundaries=%d decoded=%d valid_timeline=%s evidence_complete=%s "
+        "soft_candidates=%d",
+        report["boundaries"],
+        report["decoded_boundaries"],
+        report["valid_timeline"],
+        report["evidence_complete"],
+        report["soft_candidate_count"],
+    )
+    return report
+
+
 def sample_shot_features(video_path: Path, shots: list[Shot], keyframe_dir: Path) -> list[np.ndarray]:
     keyframe_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(video_path))
@@ -1787,6 +1971,26 @@ def main() -> None:
             runtime_details=stage,
         )
     with profiler.stage(
+        "shot_boundary_validation",
+        method="before_after_evidence",
+        compute_device="cpu",
+    ) as stage:
+        shot_validation = create_shot_boundary_evidence(
+            input_video,
+            shots,
+            work_dir / "shot-boundary-evidence",
+            media.duration,
+        )
+        stage.update(
+            boundaries=shot_validation["boundaries"],
+            decoded_boundaries=shot_validation["decoded_boundaries"],
+            valid_timeline=shot_validation["valid_timeline"],
+            evidence_complete=shot_validation["evidence_complete"],
+            validation_passed=shot_validation["validation_passed"],
+            warnings=len(shot_validation["warnings"]),
+            soft_candidates=shot_validation["soft_candidate_count"],
+        )
+    with profiler.stage(
         "shot_visual_features",
         method="opencv_hsv_histogram_and_motion",
         compute_device="cpu",
@@ -1893,6 +2097,7 @@ def main() -> None:
             {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]},
         )
         write_json(work_dir / "shots.json", [asdict(x) for x in shots])
+        write_json(work_dir / "shot-boundary-validation.json", shot_validation)
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
         write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
 

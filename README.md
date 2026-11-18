@@ -248,6 +248,24 @@ fallback stage=shot_detection from=scenedetect.ContentDetector to=opencv_frame_d
 method stage=shot_detection backend=opencv_frame_difference threshold=27.000 shots=14
 ```
 
+Shot detection is followed by an independent validation stage. It checks that
+the shots cover the whole video without gaps or overlaps, decodes frames before
+and after every detected boundary, and records pixel/histogram differences.
+Review these artifacts after a run:
+
+- `shot-boundary-validation.json`: timeline checks, boundary measurements, and
+  possible lower-confidence candidates;
+- `shot-boundary-evidence/boundary-*.jpg`: before/after images for every
+  boundary used by the pipeline;
+- `shot-boundary-evidence/soft-candidates/*.jpg`: large frame changes that did
+  not pass the configured shot threshold.
+
+Soft candidates are review-only. They are deliberately not promoted to shots,
+because motion, gestures, film damage, and animated title cards can all create
+large frame differences. `validation_passed=true` means the selected timeline
+is continuous and every selected boundary produced evidence; it does not prove
+that no gradual transition was missed.
+
 Each structured stage record includes:
 
 - `stage`, `method`, `status`, and any stage-specific counts;
