@@ -375,7 +375,53 @@ column -s, -t \
   outputs/resolution-sweep-real-scene-01-v1/resolution-comparison.csv | less -S
 ```
 
-## 9. Tests
+## 9. Compare offline ASR models
+
+Before changing the main pipeline's ASR model, run the isolated benchmark
+against the supplied human-dialogue timestamps. The recommended four-model
+comparison is:
+
+- `whisper-small`: current baseline;
+- `whisper-turbo`: Whisper Large-v3 Turbo;
+- `distil-whisper`: Distil-Whisper Large-v3;
+- `wav2vec2-large`: a non-Whisper CTC control.
+
+Stage each complete Transformers model in the matching local directory:
+
+```text
+models/whisper-small.en-transformers/
+models/whisper-large-v3-turbo/
+models/distil-large-v3/
+models/wav2vec2-large-960h-lv60-self/
+```
+
+The job loads the models sequentially, never concurrently, and uses only local
+files. Submit it on Lanta with:
+
+```bash
+sbatch scripts/submit_lanta_asr_benchmark.sh \
+  "$PWD/inputs/real-scene-01.mp4" \
+  "$PWD/outputs/asr-comparison-real-scene-01-v1"
+```
+
+To test a subset or different local checkpoints, separate `NAME=PATH` entries
+with semicolons:
+
+```bash
+ASR_MODELS="small=$PWD/models/whisper-small.en-transformers;turbo=$PWD/models/whisper-large-v3-turbo" \
+  sbatch scripts/submit_lanta_asr_benchmark.sh \
+  "$PWD/inputs/real-scene-01.mp4" \
+  "$PWD/outputs/asr-comparison-real-scene-01-v1"
+```
+
+The output includes `asr-comparison.csv`, `asr-comparison.json`, and one
+`transcript.json` per model. Compare temporal precision, recall, F1, intro
+false-positive seconds, missed-dialogue seconds, WER, runtime, real-time factor,
+and peak PyTorch GPU memory. The ranking prioritizes temporal F1 because the AD
+pipeline needs reliable speech boundaries, then WER and runtime. Do not select a
+model from WER alone.
+
+## 10. Tests
 
 ```bash
 python -m unittest discover -s tests -v
