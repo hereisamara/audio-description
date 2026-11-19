@@ -5,6 +5,9 @@ selectable audio-description track from a real video scene. It supports CPU
 and CUDA execution, uses Conda for all software dependencies, and makes no
 external API calls.
 
+For a chronological record of experiments, results, failures, and next
+decisions, see [`docs/experiment-progress-record.md`](docs/experiment-progress-record.md).
+
 Large inputs, generated videos, extracted frames, audio, model checkpoints,
 and work directories are intentionally excluded from Git. Upload those
 directly to Lanta storage instead.
@@ -18,9 +21,12 @@ real input video
   -> speech-safe narration gaps
   -> PySceneDetect ContentDetector when available; logged OpenCV fallback otherwise
   -> lightweight visual/audio/transcript scene grouping
+  -> local SQLite timestamped evidence index
+  -> adaptive frame selection from visual change, hard cuts, and soft transitions
   -> local visual backend: heuristic or Qwen2.5-VL
-  -> AD or WAIT decision
+  -> AD or WAIT decision with grounded event timestamps
   -> local Transformers VITS TTS
+  -> event-aware narration placement inside the safe gap
   -> FFmpeg soundtrack ducking and mixing
   -> MP4 with original and audio-description tracks
 ```
@@ -33,6 +39,7 @@ for real visual descriptions.
 
 ```text
 offline_ad_poc/
+  knowledge_db.py
   pipeline.py
   prepare_real_scene.py
 scripts/
@@ -193,6 +200,7 @@ For models stored elsewhere, override their locations when submitting:
 ASR_MODEL=/lustrefs/disk/home/khtun/models/whisper-small.en-transformers \
 VLM_MODEL=/lustrefs/disk/home/khtun/models/Qwen2.5-VL-3B-Instruct \
 TTS_MODEL=/lustrefs/disk/home/khtun/models/mms-tts-eng \
+EVIDENCE_FRAMES=6 \
 sbatch scripts/submit_lanta_gpu.sh "$PWD/inputs/real-scene-01.mp4"
 ```
 
@@ -208,6 +216,11 @@ The pipeline also writes a dedicated live log inside the work directory:
 ```bash
 tail -f outputs/real-scene-01-work/runtime.log
 ```
+
+For every gap, the runtime log lists the selected frame timestamps, salience,
+shot/scene references, grounded VLM event interval, final cue interval, and
+placement method. `evidence-knowledge.sqlite3` stores the same time-aligned
+frames, dialogue, boundaries, decisions, and cue positions for later analysis.
 
 The job performs a CUDA preflight before loading the models. It records
 `CUDA_VISIBLE_DEVICES`, the PyTorch build, PyTorch's CUDA runtime, availability,
@@ -332,10 +345,11 @@ pipeline sweep below.
 ### Full-pipeline resolution sweep
 
 The resolution sweep runs the same video at four evidence-frame sizes while
-keeping the model, four-frame sampling, prompt, audio, and pipeline parameters
-fixed. For a 640x480 source, the defaults test long edges of 160, 320, 480,
-and 640 pixels. The sampler never upscales a source frame, so do not add 720 or
-1080 to a 640x480 source: those settings cannot add visual information.
+keeping the model, adaptive six-frame limit, prompt, audio, and pipeline
+parameters fixed. For a 640x480 source, the defaults test long edges of 160,
+320, 480, and 640 pixels. The sampler never upscales a source frame, so do not
+add 720 or 1080 to a 640x480 source: those settings cannot add visual
+information.
 
 Submit one sequential four-run job:
 

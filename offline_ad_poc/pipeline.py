@@ -22,7 +22,7 @@ import sys
 import time
 import wave
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
@@ -30,6 +30,8 @@ from typing import Any, Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
+
+from .knowledge_db import EvidenceStore
 
 
 LOGGER = logging.getLogger("offline_ad_poc")
@@ -323,6 +325,17 @@ class Scene:
 
 
 @dataclass
+class EvidenceFrame:
+    path: str
+    timestamp: float
+    requested_timestamp: float
+    shot_id: int | None
+    scene_id: int | None
+    salience: float = 0.0
+    role: str = "gap"
+
+
+@dataclass
 class Decision:
     gap_start: float
     gap_end: float
@@ -332,6 +345,12 @@ class Decision:
     importance: float
     word_budget: int
     evidence_frames: list[str]
+    evidence_timestamps: list[float] = field(default_factory=list)
+    event_start: float | None = None
+    event_end: float | None = None
+    event_timing_source: str = "none"
+    preferred_cue_start: float | None = None
+    placement_method: str = "unplaced"
     tts_path: str = ""
     tts_duration: float = 0.0
     cue_start: float = 0.0
@@ -1200,6 +1219,173 @@ def sample_window_frames(
     return paths
 
 
+def _shot_scene_at(
+    timestamp: float,
+    shots: Sequence[Shot],
+    scenes: Sequence[Scene],
+) -> tuple[int | None, int | None]:
+    shot = next(
+        (item for item in shots if item.start <= timestamp < item.end),
+        shots[-1] if shots and math.isclose(timestamp, shots[-1].end, abs_tol=0.1) else None,
+    )
+    scene = next(
+        (item for item in scenes if shot and shot.shot_id in item.shot_ids),
+        None,
+    )
+    return (shot.shot_id if shot else None, scene.scene_id if scene else None)
+
+
+def _unique_timestamps(values: Iterable[float], minimum_spacing: float = 0.04) -> list[float]:
+    result: list[float] = []
+    for value in sorted(values):
+        if not result or value - result[-1] >= minimum_spacing:
+            result.append(value)
+    return result
+
+
+def evidence_candidate_timestamps(
+    gap: Gap,
+    shots: Sequence[Shot],
+    soft_candidate_timestamps: Sequence[float],
+    maximum_candidates: int = 24,
+) -> list[float]:
+    """Build a low-cost time grid enriched around local transition evidence."""
+    inside_end = max(gap.start, gap.end - 0.05)
+    uniform_count = min(maximum_candidates, max(5, math.ceil(gap.duration) + 1))
+    uniform_values = list(np.linspace(gap.start, inside_end, num=uniform_count))
+    anchors: list[float] = []
+    if gap.start > 0.05:
+        anchors.append(max(0.0, gap.start - min(1.0, gap.start)))
+    for shot in shots[1:]:
+        if gap.start <= shot.start <= gap.end:
+            anchors.extend((shot.start, min(inside_end, shot.start + 0.15)))
+    for timestamp in soft_candidate_timestamps:
+        if gap.start <= timestamp <= gap.end:
+            anchors.extend((timestamp, min(inside_end, timestamp + 0.15)))
+    selected = _unique_timestamps(anchors)
+    selected.extend(
+        value
+        for value in uniform_values
+        if all(abs(value - anchor) >= 0.04 for anchor in selected)
+    )
+    return sorted(selected)
+
+
+def sample_event_evidence_frames(
+    video_path: Path,
+    gap: Gap,
+    shots: Sequence[Shot],
+    scenes: Sequence[Scene],
+    soft_candidate_timestamps: Sequence[float],
+    output_dir: Path,
+    maximum_frames: int = 6,
+    max_edge: int | None = None,
+) -> list[EvidenceFrame]:
+    """Select timestamped frames using local change and boundary evidence."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path}")
+    hard_boundaries = [shot.start for shot in shots[1:]]
+    decoded: list[dict[str, Any]] = []
+    previous_gray: np.ndarray | None = None
+    previous_histogram: np.ndarray | None = None
+    try:
+        for requested in evidence_candidate_timestamps(gap, shots, soft_candidate_timestamps):
+            frame = frame_at(capture, requested)
+            if frame is None:
+                continue
+            reported = float(capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0)
+            timestamp = reported if reported > 0 and abs(reported - requested) <= 1.0 else requested
+            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            histogram = normalized_histogram(small)
+            if previous_gray is None or previous_histogram is None:
+                change = 0.0
+            else:
+                pixel = float(np.mean(cv2.absdiff(previous_gray, gray)) / 255.0)
+                histogram_change = float(
+                    1.0 - np.clip(np.dot(previous_histogram, histogram), 0.0, 1.0)
+                )
+                change = 0.65 * pixel + 0.35 * histogram_change
+            hard_distance = min((abs(requested - value) for value in hard_boundaries), default=999.0)
+            soft_distance = min(
+                (abs(requested - value) for value in soft_candidate_timestamps),
+                default=999.0,
+            )
+            boundary_bonus = 0.35 if hard_distance <= 0.20 else 0.18 if soft_distance <= 0.20 else 0.0
+            role = (
+                "context_before"
+                if requested < gap.start
+                else "confirmed_cut"
+                if hard_distance <= 0.20
+                else "soft_transition"
+                if soft_distance <= 0.20
+                else "gap"
+            )
+            decoded.append(
+                {
+                    "frame": frame,
+                    "requested": requested,
+                    "timestamp": timestamp,
+                    "salience": change + boundary_bonus,
+                    "role": role,
+                }
+            )
+            previous_gray = gray
+            previous_histogram = histogram
+    finally:
+        capture.release()
+    if not decoded:
+        return []
+
+    required_indices = {0, len(decoded) - 1}
+    first_inside = next(
+        (index for index, item in enumerate(decoded) if item["requested"] >= gap.start),
+        0,
+    )
+    required_indices.add(first_inside)
+    ranked = sorted(
+        range(len(decoded)),
+        key=lambda index: (decoded[index]["salience"], -decoded[index]["requested"]),
+        reverse=True,
+    )
+    selected_indices = set(required_indices)
+    for index in ranked:
+        if len(selected_indices) >= maximum_frames:
+            break
+        timestamp = decoded[index]["requested"]
+        if any(abs(timestamp - decoded[other]["requested"]) < 0.30 for other in selected_indices):
+            continue
+        selected_indices.add(index)
+    if len(selected_indices) < maximum_frames:
+        for index in ranked:
+            selected_indices.add(index)
+            if len(selected_indices) >= maximum_frames:
+                break
+
+    evidence: list[EvidenceFrame] = []
+    for output_index, index in enumerate(sorted(selected_indices), start=1):
+        item = decoded[index]
+        frame = resize_frame_max_edge(item["frame"], max_edge)
+        timestamp = float(item["timestamp"])
+        path = output_dir / f"frame-{output_index:02d}-{timestamp:.3f}.jpg"
+        cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        shot_id, scene_id = _shot_scene_at(timestamp, shots, scenes)
+        evidence.append(
+            EvidenceFrame(
+                path=str(path),
+                timestamp=round(timestamp, 6),
+                requested_timestamp=round(float(item["requested"]), 6),
+                shot_id=shot_id,
+                scene_id=scene_id,
+                salience=round(float(item["salience"]), 6),
+                role=str(item["role"]),
+            )
+        )
+    return evidence
+
+
 def json_object_from_text(text: str) -> dict[str, Any]:
     cleaned = text.strip().replace("```json", "").replace("```", "").strip()
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
@@ -1211,7 +1397,7 @@ def json_object_from_text(text: str) -> dict[str, Any]:
 class VisualBackend:
     def decide(
         self,
-        frames: Sequence[Path],
+        frames: Sequence[EvidenceFrame],
         gap: Gap,
         transcript: str,
         previous_ad: Sequence[str],
@@ -1228,7 +1414,7 @@ class HeuristicBackend(VisualBackend):
 
     def decide(
         self,
-        frames: Sequence[Path],
+        frames: Sequence[EvidenceFrame],
         gap: Gap,
         transcript: str,
         previous_ad: Sequence[str],
@@ -1259,11 +1445,19 @@ class HeuristicBackend(VisualBackend):
                 "reason": "same heuristic description was already emitted",
                 "importance": 0.0,
             }
+        most_salient = max(
+            (frame for frame in frames if gap.start <= frame.timestamp <= gap.end),
+            key=lambda frame: frame.salience,
+            default=None,
+        )
         return {
             "decision": "AD",
             "description": description,
             "reason": reason,
             "importance": round(importance, 3),
+            "event_start": most_salient.timestamp if most_salient else gap.start,
+            "event_end": most_salient.timestamp if most_salient else gap.start,
+            "evidence_timestamps": [most_salient.timestamp] if most_salient else [],
         }
 
 
@@ -1328,25 +1522,51 @@ class Qwen25Backend(VisualBackend):
 
     def decide(
         self,
-        frames: Sequence[Path],
+        frames: Sequence[EvidenceFrame],
         gap: Gap,
         transcript: str,
         previous_ad: Sequence[str],
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        frame_index = ", ".join(
+            f"{index}={frame.timestamp:.3f}s ({frame.role}, salience={frame.salience:.3f})"
+            for index, frame in enumerate(frames, start=1)
+        )
+        retrieved_boundaries = context.get("knowledge", {}).get("boundaries", [])
+        boundary_index = ", ".join(
+            f"{item['timestamp']:.3f}s:{item['kind']}"
+            for item in retrieved_boundaries
+        ) or "none"
         prompt = (
             "You are deciding whether an audio description is needed in a speech-free film interval. "
-            "Use only visible evidence from the ordered frames. Return WAIT for static, redundant, "
+            "Each ordered image has an explicit timestamp in the frame index below. "
+            "Use only visible evidence from those frames. Return WAIT for static, redundant, "
             "incomplete, uncertain, or unimportant content. Return AD only for meaningful new action, "
             "location change, character behaviour, or an important visual detail not conveyed by audio. "
             f"The safe gap is {gap.duration:.2f} seconds and the maximum is {gap.word_budget} words. "
+            f"Safe gap timestamps: {gap.start:.3f}s to {gap.end:.3f}s. "
+            f"Frame index: {frame_index or 'none'}. "
+            f"Local transition evidence: {boundary_index}. "
             f"Recent dialogue: {transcript or 'none'}. "
             f"Previous AD: {' | '.join(previous_ad[-3:]) or 'none'}. "
-            "Never mention the camera or invent names, emotions, causes, or off-screen facts. "
-            "Return exactly one JSON object with keys decision, description, reason, importance. "
-            "decision must be AD or WAIT. description must be empty for WAIT. importance is 0 to 1."
+            "Scene IDs may be too coarse, so use local visual changes instead of assuming one scene ID "
+            "means one continuous event. Never mention the camera or invent names, emotions, causes, "
+            "or off-screen facts. Return exactly one JSON object with keys decision, description, reason, "
+            "importance, event_start, event_end, evidence_timestamps. decision must be AD or WAIT. "
+            "description must be empty for WAIT. importance is 0 to 1. For AD, event_start and event_end "
+            "must be timestamps copied from the frame index, and evidence_timestamps must list the copied "
+            "timestamps that directly support the description. For WAIT, use null event times and an "
+            "empty evidence_timestamps list."
         )
-        content = [{"type": "image", "image": str(path.resolve())} for path in frames]
+        content: list[dict[str, Any]] = []
+        for index, frame in enumerate(frames, start=1):
+            content.append({"type": "image", "image": str(Path(frame.path).resolve())})
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"Frame {index} timestamp: {frame.timestamp:.3f}s; role: {frame.role}.",
+                }
+            )
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         chat_text = self.tokenizer.apply_chat_template(
@@ -1355,8 +1575,8 @@ class Qwen25Backend(VisualBackend):
             add_generation_prompt=True,
         )
         image_inputs = []
-        for path in frames:
-            with self.image_type.open(path) as image:
+        for frame in frames:
+            with self.image_type.open(frame.path) as image:
                 image_inputs.append(image.convert("RGB"))
         image_features = self.image_processor(images=image_inputs, return_tensors="pt")
         image_grid_thw = image_features["image_grid_thw"]
@@ -1398,7 +1618,12 @@ class Qwen25Backend(VisualBackend):
         return json_object_from_text(decoded)
 
 
-def context_for_gap(gap: Gap, shots: Sequence[Shot], scenes: Sequence[Scene]) -> dict[str, Any]:
+def context_for_gap(
+    gap: Gap,
+    shots: Sequence[Shot],
+    scenes: Sequence[Scene],
+    soft_candidate_timestamps: Sequence[float] = (),
+) -> dict[str, Any]:
     window_start = max(0.0, gap.start - 8.0)
     relevant = [shot for shot in shots if overlap(window_start, gap.end, shot.start, shot.end) > 0]
     current = max(relevant, key=lambda shot: overlap(window_start, gap.end, shot.start, shot.end)) if relevant else None
@@ -1410,6 +1635,12 @@ def context_for_gap(gap: Gap, shots: Sequence[Shot], scenes: Sequence[Scene]) ->
         "scene_id": scene.scene_id if scene else None,
         "boundary_score": max((shot.boundary_score for shot in relevant), default=0.0),
         "motion": max((shot.motion for shot in relevant), default=0.0),
+        "confirmed_boundaries": [
+            shot.start for shot in shots[1:] if window_start <= shot.start <= gap.end
+        ],
+        "soft_candidate_timestamps": [
+            value for value in soft_candidate_timestamps if window_start <= value <= gap.end
+        ],
     }
 
 
@@ -1442,6 +1673,65 @@ def choose_backend(name: str, model_path: str | None, device: str) -> VisualBack
     raise ValueError(f"Unknown visual backend: {name}")
 
 
+def _coerce_timestamp(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def normalize_event_payload(
+    payload: dict[str, Any],
+    frames: Sequence[EvidenceFrame],
+    gap: Gap,
+) -> dict[str, Any]:
+    """Ground model-provided event times in the frames that were actually decoded."""
+    normalized = dict(payload)
+    if str(payload.get("decision", "WAIT")).upper() != "AD" or not frames:
+        normalized.update(
+            event_start=None,
+            event_end=None,
+            evidence_timestamps=[],
+            event_timing_source="none",
+        )
+        return normalized
+    available = sorted({frame.timestamp for frame in frames})
+    inside = [value for value in available if gap.start <= value <= gap.end]
+    permitted = inside or available
+
+    def snap(value: Any) -> float | None:
+        timestamp = _coerce_timestamp(value)
+        if timestamp is None:
+            return None
+        return min(permitted, key=lambda candidate: abs(candidate - timestamp))
+
+    requested_evidence = payload.get("evidence_timestamps", [])
+    if not isinstance(requested_evidence, list):
+        requested_evidence = []
+    evidence = [value for value in (snap(item) for item in requested_evidence) if value is not None]
+    raw_start = snap(payload.get("event_start"))
+    raw_end = snap(payload.get("event_end"))
+    if raw_start is not None:
+        evidence.append(raw_start)
+    if raw_end is not None:
+        evidence.append(raw_end)
+    if not evidence:
+        fallback = max(
+            (frame for frame in frames if frame.timestamp in permitted),
+            key=lambda frame: frame.salience,
+        )
+        evidence = [fallback.timestamp]
+        normalized["event_timing_source"] = "highest_salience_evidence_frame"
+    else:
+        normalized["event_timing_source"] = "model_timestamps_grounded_to_frames"
+    evidence = sorted(set(evidence))
+    normalized["evidence_timestamps"] = evidence
+    normalized["event_start"] = max(gap.start, evidence[0])
+    normalized["event_end"] = min(gap.end, max(evidence[-1], normalized["event_start"]))
+    return normalized
+
+
 def make_decisions(
     video_path: Path,
     gaps: Sequence[Gap],
@@ -1452,19 +1742,46 @@ def make_decisions(
     frame_root: Path,
     maximum_gaps: int,
     evidence_max_edge: int | None = None,
+    evidence_frames_per_gap: int = 6,
+    soft_candidate_timestamps: Sequence[float] = (),
+    knowledge_store: EvidenceStore | None = None,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
     for index, gap in enumerate(gaps[:maximum_gaps], start=1):
-        context = context_for_gap(gap, shots, scenes)
-        frames = sample_window_frames(
+        context = context_for_gap(gap, shots, scenes, soft_candidate_timestamps)
+        frames = sample_event_evidence_frames(
             video_path,
-            float(context["window_start"]),
-            float(context["window_end"]),
+            gap,
+            shots,
+            scenes,
+            soft_candidate_timestamps,
             frame_root / f"gap-{index:03d}",
-            count=4,
+            maximum_frames=evidence_frames_per_gap,
             max_edge=evidence_max_edge,
         )
+        LOGGER.info(
+            "evidence gap=%d range=%.3f-%.3f frames=%s",
+            index,
+            gap.start,
+            gap.end,
+            json.dumps(
+                [
+                    {
+                        "timestamp": frame.timestamp,
+                        "shot_id": frame.shot_id,
+                        "scene_id": frame.scene_id,
+                        "salience": frame.salience,
+                        "role": frame.role,
+                    }
+                    for frame in frames
+                ],
+                sort_keys=True,
+            ),
+        )
+        if knowledge_store is not None:
+            knowledge_store.record_frames(index, frames)
+            context["knowledge"] = knowledge_store.query_gap_context(gap.start, gap.end)
         try:
             payload = backend.decide(
                 frames,
@@ -1480,6 +1797,7 @@ def make_decisions(
                 "reason": f"visual backend failure: {type(exc).__name__}: {exc}",
                 "importance": 0.0,
             }
+        payload = normalize_event_payload(payload, frames, gap)
         decision_name = str(payload.get("decision", "WAIT")).upper()
         if decision_name not in {"AD", "WAIT"}:
             decision_name = "WAIT"
@@ -1487,6 +1805,13 @@ def make_decisions(
         description = limit_words(description, gap.word_budget) if description else ""
         if decision_name == "AD" and not description:
             decision_name = "WAIT"
+        if decision_name == "WAIT":
+            payload.update(
+                event_start=None,
+                event_end=None,
+                evidence_timestamps=[],
+                event_timing_source="none",
+            )
         decision = Decision(
             gap_start=gap.start,
             gap_end=gap.end,
@@ -1495,9 +1820,32 @@ def make_decisions(
             reason=str(payload.get("reason", "")),
             importance=float(payload.get("importance", 0.0)),
             word_budget=gap.word_budget,
-            evidence_frames=[str(path) for path in frames],
+            evidence_frames=[frame.path for frame in frames],
+            evidence_timestamps=[float(value) for value in payload.get("evidence_timestamps", [])],
+            event_start=_coerce_timestamp(payload.get("event_start")),
+            event_end=_coerce_timestamp(payload.get("event_end")),
+            event_timing_source=str(payload.get("event_timing_source", "none")),
+            preferred_cue_start=(
+                _coerce_timestamp(payload.get("event_start")) + 0.15
+                if _coerce_timestamp(payload.get("event_start")) is not None
+                else None
+            ),
         )
         decisions.append(decision)
+        LOGGER.info(
+            "ad_decision gap=%d decision=%s event_start=%s event_end=%s timing_source=%s "
+            "evidence_timestamps=%s importance=%.3f reason=%s",
+            index,
+            decision.decision,
+            decision.event_start,
+            decision.event_end,
+            decision.event_timing_source,
+            decision.evidence_timestamps,
+            decision.importance,
+            decision.reason.replace("\n", " "),
+        )
+        if knowledge_store is not None:
+            knowledge_store.record_decision(index, decision)
         if decision.decision == "AD":
             previous_ad.append(decision.description)
     return decisions
@@ -1602,6 +1950,35 @@ def probe_duration(path: Path, ffprobe: str) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
+def choose_event_aware_cue_start(
+    decision: Decision,
+    narration_duration: float,
+    safety_margin: float = 0.075,
+    maximum_anticipation: float = 0.35,
+) -> tuple[float | None, str]:
+    """Choose a safe cue near the visual event without narrating it too early."""
+    earliest = decision.gap_start + safety_margin
+    latest = decision.gap_end - safety_margin - narration_duration
+    if latest < earliest:
+        return None, "no_gap_fit"
+    if decision.event_start is None:
+        centered = decision.gap_start + (decision.gap_end - decision.gap_start - narration_duration) / 2.0
+        return min(max(centered, earliest), latest), "gap_center_fallback"
+    preferred = decision.preferred_cue_start
+    if preferred is None:
+        preferred = decision.event_start + 0.15
+    cue_start = min(max(preferred, earliest), latest)
+    if cue_start < decision.event_start - maximum_anticipation:
+        return None, "no_post_event_fit"
+    if math.isclose(cue_start, preferred, abs_tol=0.001):
+        method = "event_aligned"
+    elif cue_start < preferred:
+        method = "event_shifted_earlier_to_fit"
+    else:
+        method = "event_shifted_later_for_gap_margin"
+    return cue_start, method
+
+
 def synthesize_decisions(
     decisions: list[Decision],
     output_dir: Path,
@@ -1628,20 +2005,49 @@ def synthesize_decisions(
                 device,
             )
             duration = probe_duration(audio_path, ffprobe)
-            if duration <= available:
+            cue_start, placement_method = choose_event_aware_cue_start(decision, duration)
+            if duration <= available and cue_start is not None:
                 decision.description = text
                 decision.tts_path = str(audio_path)
                 decision.tts_duration = duration
-                decision.cue_start = decision.gap_start + (decision.gap_end - decision.gap_start - duration) / 2.0
+                decision.cue_start = cue_start
                 decision.cue_end = decision.cue_start + duration
+                decision.placement_method = placement_method
+                LOGGER.info(
+                    "ad_placement decision=%d gap=%.3f-%.3f event=%.3f-%.3f "
+                    "cue=%.3f-%.3f method=%s tts_duration=%.3f",
+                    index,
+                    decision.gap_start,
+                    decision.gap_end,
+                    decision.event_start if decision.event_start is not None else -1.0,
+                    decision.event_end if decision.event_end is not None else -1.0,
+                    decision.cue_start,
+                    decision.cue_end,
+                    placement_method,
+                    duration,
+                )
                 break
             words = text.split()
-            target = max(2, math.floor(len(words) * available / max(duration, 0.01) * 0.88))
-            text = limit_words(text, min(target, len(words) - 1))
+            if len(words) <= 2:
+                break
+            event_available = available
+            if decision.event_start is not None:
+                event_available = max(
+                    0.25,
+                    decision.gap_end
+                    - 0.075
+                    - max(decision.gap_start + 0.075, decision.event_start - 0.35),
+                )
+            target = max(
+                2,
+                math.floor(len(words) * min(available, event_available) / max(duration, 0.01) * 0.88),
+            )
+            text = limit_words(text, max(2, min(target, len(words) - 1)))
         if not decision.tts_path:
             decision.decision = "WAIT"
-            decision.reason = "TTS could not fit the safe gap after shortening"
+            decision.reason = "TTS could not fit a safe post-event slot after shortening"
             decision.description = ""
+            decision.placement_method = "rejected_no_safe_event_slot"
     return backend, decisions
 
 
@@ -1794,6 +2200,11 @@ def evaluate(
         for item in active
         for interval in speech
     )
+    event_offsets = [
+        item.cue_start - item.event_start
+        for item in active
+        if item.event_start is not None
+    ]
     return {
         "duration_seconds": round(media.duration, 3),
         "shots": len(shots),
@@ -1802,6 +2213,16 @@ def evaluate(
         "processed_gaps": len(decisions),
         "accepted_ad_events": len(active),
         "wait_events": sum(item.decision == "WAIT" for item in decisions),
+        "event_grounded_ad_events": sum(item.event_start is not None for item in active),
+        "event_aligned_ad_events": sum(
+            item.placement_method.startswith("event_") for item in active
+        ),
+        "rejected_no_safe_event_slot": sum(
+            item.placement_method == "rejected_no_safe_event_slot" for item in decisions
+        ),
+        "mean_cue_start_offset_from_event_seconds": (
+            round(sum(event_offsets) / len(event_offsets), 4) if event_offsets else None
+        ),
         "speech_overlap_seconds": round(overlap_seconds, 4),
         "tts_fit_rate": round(
             sum(item.tts_duration <= item.gap_end - item.gap_start for item in active) / len(active), 4
@@ -1858,6 +2279,12 @@ def parse_args() -> argparse.Namespace:
             "0 preserves the source resolution"
         ),
     )
+    parser.add_argument(
+        "--evidence-frames",
+        type=int,
+        default=6,
+        help="Maximum event-selected frames supplied to the VLM for each gap",
+    )
     parser.add_argument("--shot-threshold", type=float, default=27.0)
     parser.add_argument("--scene-threshold", type=float, default=0.52)
     return parser.parse_args()
@@ -1867,6 +2294,8 @@ def main() -> None:
     args = parse_args()
     if args.evidence_max_edge < 0:
         raise ValueError("--evidence-max-edge must be zero or a positive integer")
+    if args.evidence_frames < 3:
+        raise ValueError("--evidence-frames must be at least 3")
     started = time.perf_counter()
     input_video = args.input.resolve()
     output_video = args.output_video.resolve()
@@ -2016,6 +2445,33 @@ def main() -> None:
         scenes = segment_scenes(shots, histograms, boundary_threshold=args.scene_threshold)
         stage.update(boundary_threshold=args.scene_threshold, scenes=len(scenes))
 
+    soft_candidate_timestamps = [
+        float(item["timestamp"])
+        for item in shot_validation.get("soft_candidates_requiring_review", [])
+        if "timestamp" in item
+    ]
+    knowledge_store = EvidenceStore(work_dir / "evidence-knowledge.sqlite3")
+    with profiler.stage(
+        "knowledge_index",
+        method="sqlite_timestamp_evidence_store",
+        compute_device="cpu",
+    ) as stage:
+        knowledge_store.index_timeline(
+            input_video,
+            media.duration,
+            segments,
+            shots,
+            scenes,
+            shot_validation,
+        )
+        stage.update(
+            transcript_segments=len(segments),
+            shots=len(shots),
+            scenes=len(scenes),
+            confirmed_boundaries=max(0, len(shots) - 1),
+            soft_candidates=len(soft_candidate_timestamps),
+        )
+
     visual_compute_device = device if args.visual_backend == "qwen25" else "cpu"
     with profiler.stage(
         "visual_backend_initialization",
@@ -2028,7 +2484,8 @@ def main() -> None:
         method=args.visual_backend,
         compute_device=visual_compute_device,
         evidence_max_edge=args.evidence_max_edge or "source",
-        evidence_frames_per_gap=4,
+        evidence_frames_per_gap=args.evidence_frames,
+        evidence_sampling="adaptive_visual_change_and_boundaries",
     ) as stage:
         decisions = make_decisions(
             input_video,
@@ -2040,6 +2497,9 @@ def main() -> None:
             work_dir / "evidence-frames",
             args.maximum_gaps,
             args.evidence_max_edge or None,
+            args.evidence_frames,
+            soft_candidate_timestamps,
+            knowledge_store,
         )
         stage.update(
             processed_gaps=len(decisions),
@@ -2070,7 +2530,19 @@ def main() -> None:
             method=tts_backend,
             compute_device=device if tts_backend == "transformers" else "cpu",
             generated_cues=sum(bool(item.tts_path) for item in decisions),
+            event_aligned_cues=sum(
+                item.placement_method.startswith("event_") for item in decisions if item.tts_path
+            ),
         )
+
+    with profiler.stage(
+        "knowledge_finalize",
+        method="sqlite_decision_upsert",
+        compute_device="cpu",
+    ):
+        for index, decision in enumerate(decisions, start=1):
+            knowledge_store.record_decision(index, decision)
+        knowledge_store.close()
 
     with profiler.stage("artifact_write", method="json_and_webvtt", compute_device="cpu"):
         write_vtt(decisions, work_dir / "descriptions.vtt")

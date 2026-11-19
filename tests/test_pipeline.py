@@ -14,23 +14,30 @@ from offline_ad_poc.pipeline import (
     Gap,
     Interval,
     Decision,
+    EvidenceFrame,
     RuntimeProfiler,
+    Scene,
     Shot,
     Word,
     _detect_shots_opencv,
     _segments_from_words,
     _whisper_generate_kwargs,
     build_gaps,
+    choose_event_aware_cue_start,
+    evidence_candidate_timestamps,
     expand_qwen_image_tokens,
     limit_words,
     merge_intervals,
     mix_described_video,
+    normalize_event_payload,
     resize_frame_max_edge,
+    sample_event_evidence_frames,
     segment_scenes,
     speech_intervals_from_words,
     validate_whisper_word_timestamps,
     validate_shot_timeline,
 )
+from offline_ad_poc.knowledge_db import EvidenceStore
 
 
 class PipelineUnitTests(unittest.TestCase):
@@ -141,6 +148,157 @@ class PipelineUnitTests(unittest.TestCase):
 
         self.assertEqual(resized.shape, (240, 320, 3))
         self.assertIs(unchanged, frame)
+
+    def test_event_payload_timestamps_are_snapped_to_decoded_frames(self) -> None:
+        frames = [
+            EvidenceFrame("one.jpg", 5.0, 5.0, 1, 1, salience=0.1),
+            EvidenceFrame("two.jpg", 9.0, 9.0, 1, 1, salience=0.7),
+            EvidenceFrame("three.jpg", 13.0, 13.0, 2, 1, salience=0.3),
+        ]
+        payload = normalize_event_payload(
+            {
+                "decision": "AD",
+                "event_start": 8.7,
+                "event_end": 12.8,
+                "evidence_timestamps": [8.8, 13.2],
+            },
+            frames,
+            Gap(4.0, 14.0, 12),
+        )
+
+        self.assertEqual(payload["event_start"], 9.0)
+        self.assertEqual(payload["event_end"], 13.0)
+        self.assertEqual(payload["evidence_timestamps"], [9.0, 13.0])
+
+    def test_event_aware_placement_is_not_gap_centered(self) -> None:
+        decision = Decision(
+            gap_start=0.0,
+            gap_end=20.0,
+            decision="AD",
+            description="A woman enters.",
+            reason="new action",
+            importance=0.8,
+            word_budget=20,
+            evidence_frames=[],
+            event_start=10.0,
+            event_end=11.0,
+            preferred_cue_start=10.15,
+        )
+
+        cue_start, method = choose_event_aware_cue_start(decision, narration_duration=4.0)
+
+        self.assertAlmostEqual(cue_start, 10.15)
+        self.assertEqual(method, "event_aligned")
+        self.assertNotAlmostEqual(cue_start, 8.0)
+
+    def test_event_aware_placement_rejects_spoiler_before_late_event(self) -> None:
+        decision = Decision(
+            gap_start=0.0,
+            gap_end=20.0,
+            decision="AD",
+            description="The door opens.",
+            reason="new action",
+            importance=0.8,
+            word_budget=20,
+            evidence_frames=[],
+            event_start=19.0,
+            event_end=19.0,
+            preferred_cue_start=19.15,
+        )
+
+        cue_start, method = choose_event_aware_cue_start(decision, narration_duration=3.0)
+
+        self.assertIsNone(cue_start)
+        self.assertEqual(method, "no_post_event_fit")
+
+    def test_candidate_timestamps_include_boundaries_independent_of_scene_split(self) -> None:
+        gap = Gap(10.0, 20.0, 20)
+        shots = [Shot(1, 0.0, 15.0), Shot(2, 15.0, 25.0)]
+        timestamps = evidence_candidate_timestamps(gap, shots, [17.0])
+
+        self.assertIn(15.0, timestamps)
+        self.assertIn(17.0, timestamps)
+        self.assertTrue(any(value < gap.start for value in timestamps))
+
+    def test_adaptive_sampler_keeps_timestamps_and_cut_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            video_path = directory_path / "event-cut.avi"
+            writer = cv2.VideoWriter(
+                str(video_path),
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                10.0,
+                (64, 48),
+            )
+            self.assertTrue(writer.isOpened())
+            try:
+                for value in (0,) * 20 + (255,) * 20:
+                    writer.write(np.full((48, 64, 3), value, dtype=np.uint8))
+            finally:
+                writer.release()
+            shots = [Shot(1, 0.0, 2.0), Shot(2, 2.0, 4.0)]
+            scenes = [Scene(1, 0.0, 4.0, [1, 2], 0.0)]
+
+            frames = sample_event_evidence_frames(
+                video_path,
+                Gap(1.0, 3.5, 8),
+                shots,
+                scenes,
+                [],
+                directory_path / "frames",
+                maximum_frames=5,
+                max_edge=32,
+            )
+
+        self.assertLessEqual(len(frames), 5)
+        self.assertEqual([frame.timestamp for frame in frames], sorted(frame.timestamp for frame in frames))
+        self.assertTrue(any(frame.role == "confirmed_cut" for frame in frames))
+        self.assertTrue(all(frame.shot_id in {1, 2} for frame in frames))
+
+    def test_evidence_store_retrieves_timestamped_gap_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = EvidenceStore(Path(directory) / "evidence.sqlite3")
+            segments = [SimpleNamespace(start=1.0, end=2.0, text="hello")]
+            shots = [Shot(1, 0.0, 5.0)]
+            scenes = [Scene(1, 0.0, 5.0, [1], 0.0)]
+            validation = {
+                "evidence": [],
+                "soft_candidates_requiring_review": [
+                    {"timestamp": 3.0, "frame_difference_score": 12.5}
+                ],
+            }
+            store.index_timeline(Path("video.mp4"), 5.0, segments, shots, scenes, validation)
+            store.record_frames(
+                1,
+                [EvidenceFrame("frame.jpg", 3.1, 3.0, 1, 1, 0.8, "soft_transition")],
+            )
+            store.record_decision(
+                1,
+                Decision(
+                    gap_start=2.5,
+                    gap_end=4.5,
+                    decision="AD",
+                    description="A door opens.",
+                    reason="new action",
+                    importance=0.8,
+                    word_budget=8,
+                    evidence_frames=["frame.jpg"],
+                    evidence_timestamps=[3.1],
+                    event_start=3.1,
+                    event_end=3.1,
+                    event_timing_source="model_timestamps_grounded_to_frames",
+                    placement_method="event_aligned",
+                ),
+            )
+
+            context = store.query_gap_context(2.5, 4.5)
+            later_context = store.query_gap_context(4.5, 5.0)
+            store.close()
+
+        self.assertEqual(context["boundaries"][0]["kind"], "soft_candidate")
+        self.assertEqual(context["frames"][0]["timestamp"], 3.1)
+        self.assertEqual(context["frames"][0]["shot_id"], 1)
+        self.assertEqual(later_context["previous_ad"][0]["description"], "A door opens.")
 
     @patch("offline_ad_poc.pipeline.run_command")
     def test_wait_only_output_copies_original_streams(self, run_command) -> None:

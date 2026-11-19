@@ -10,7 +10,7 @@ from typing import Any
 
 import cv2
 
-from .pipeline import Gap, Qwen25Backend, frame_at, resize_frame_max_edge
+from .pipeline import EvidenceFrame, Gap, Qwen25Backend, frame_at, resize_frame_max_edge
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,12 +123,21 @@ def main() -> None:
     for max_edge in args.resolutions:
         prepared = prepared_frames[max_edge]
         image_path = prepared["path"]
+        evidence_frame = EvidenceFrame(
+            path=str(image_path),
+            timestamp=args.timestamp,
+            requested_timestamp=args.timestamp,
+            shot_id=None,
+            scene_id=None,
+            salience=0.0,
+            role="benchmark",
+        )
         for warmup_index in range(args.warmup_runs):
             print(
                 f"Warm-up {warmup_index + 1}/{args.warmup_runs} at max edge {max_edge}; excluded from results",
                 flush=True,
             )
-            backend.decide([image_path], gap, dialogue, [], {})
+            backend.decide([evidence_frame], gap, dialogue, [], {})
             torch.cuda.synchronize()
         samples: list[dict[str, Any]] = []
         for repeat_index in range(args.repeats):
@@ -138,7 +147,7 @@ def main() -> None:
             torch.cuda.synchronize()
             allocated_start = torch.cuda.memory_allocated() / (1024**2)
             started = time.perf_counter()
-            payload = backend.decide([image_path], gap, dialogue, [], {})
+            payload = backend.decide([evidence_frame], gap, dialogue, [], {})
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - started
             peak_allocated = torch.cuda.max_memory_allocated() / (1024**2)

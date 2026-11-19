@@ -30,6 +30,7 @@ asr_model=${ASR_MODEL:-"$repo_dir/models/whisper-small.en-transformers"}
 vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
 tts_model=${TTS_MODEL:-"$repo_dir/models/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
+evidence_frames=${EVIDENCE_FRAMES:-6}
 resolution_values=${RESOLUTIONS:-"160 320 480 640"}
 read -r -a resolutions <<< "$resolution_values"
 
@@ -85,6 +86,7 @@ for resolution in "${resolutions[@]}"; do
     --tts-backend transformers \
     --tts-model "$tts_model" \
     --maximum-gaps "$maximum_gaps" \
+    --evidence-frames "$evidence_frames" \
     --evidence-max-edge "$resolution"
 done
 

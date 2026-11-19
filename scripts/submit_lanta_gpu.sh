@@ -32,6 +32,7 @@ asr_model=${ASR_MODEL:-"$repo_dir/models/whisper-small.en-transformers"}
 vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
 tts_model=${TTS_MODEL:-"$repo_dir/models/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
+evidence_frames=${EVIDENCE_FRAMES:-6}
 
 for required_path in "$input_video" "$asr_model" "$vlm_model" "$tts_model"; do
   if [[ ! -e "$required_path" ]]; then
@@ -71,6 +72,7 @@ conda run --no-capture-output -n "$conda_env" \
   --vlm-model "$vlm_model" \
   --tts-backend transformers \
   --tts-model "$tts_model" \
+  --evidence-frames "$evidence_frames" \
   --maximum-gaps "$maximum_gaps"
 
 echo "Finished: $output_video"
