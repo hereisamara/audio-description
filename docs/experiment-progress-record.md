@@ -840,6 +840,25 @@ windows and selected a frame at 31.999 seconds. On Lanta, compare job
 count. Review frame-ID-grounded cues, retry and failure counts, dialogue
 overlap, Qwen time, and peak GPU memory.
 
+### 18. Multi-event scheduling and bounded visual review
+
+**Status:** Implemented and tested locally. Lanta inference timing is pending.
+
+The initial Phase 1 scheduler advanced just the first eligible visual proposal
+in each gap. The multi-event planner keeps distinct proposals and fits each
+measured TTS clip after the frame that supports its full description. Nearby
+potential duplicates can trigger a visual comparison. An event that appears
+too late for its sentence can trigger a short scan for earlier supporting
+evidence. These reviews share a configurable video-wide Qwen call budget.
+
+The seven gaps from job `6694977` produce 12 initial windows under the
+12-second maximum. Budgeting two extra calls at 4.8 seconds each gives a
+67.2-second estimate for the decision stage before initial retries. Compare
+`AD_PLAN=single`, `AD_PLAN=multi EVENT_FOLLOWUPS=0`, and
+`AD_PLAN=multi EVENT_FOLLOWUPS=2` with the same input and models. Review
+useful cues added, false duplicates removed, cue conflicts, actual extra-call
+time, and peak GPU memory.
+
 ## Next experiment order
 
 1. Run the updated event-aware pipeline on Lanta and inspect selected evidence,

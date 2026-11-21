@@ -218,16 +218,32 @@ tail -f outputs/real-scene-01-work/runtime.log
 ```
 
 For Qwen runs, each dialogue gap is covered by consecutive windows of at most
-12 seconds. `EVIDENCE_FRAMES` caps the images per Qwen call. The pipeline scans
-the windows sequentially and advances the first eligible proposal from each
-gap to TTS. More windows can increase the total inference time.
+12 seconds. `EVIDENCE_FRAMES` caps the images per Qwen call. The multi-event
+planner considers one proposal per window and schedules measured TTS near each
+description-ready time, with clearance between cues. Nearby similar proposals
+can share a targeted visual review. A cue that looks too late to fit can trigger
+a short scan just before its supporting frame.
+
+For a controlled Slurm comparison, keep the input, models and frame limit the
+same. Set `AD_PLAN=single` for the first-eligible baseline or
+`AD_PLAN=multi EVENT_FOLLOWUPS=0` for multi-cue scheduling with no extra Qwen
+calls. The default `AD_PLAN=multi EVENT_FOLLOWUPS=2` allows up to two extra
+calls across the entire video. Use a fresh work directory for each run.
+Pass `QWEN_SECONDS_PER_CALL=4.8` to estimate decision-stage time using the
+average from job `6694977`. The call plan appears in the run log and report.
+The estimate covers the initial windows and extra-call allowance, with a
+separate maximum call count that includes initial validation retries.
 
 - `ad-proposals.json` records every window, frame ID and timestamp, raw model
-  output, validation error, and the proposal selected before TTS.
+  output, validation error, proposals selected before TTS, and any follow-up
+  calls and elapsed time.
 - `ad-decisions.json` records the final outcome, including the selected window,
   description-ready timestamp and cue placement.
 - `evidence-knowledge.sqlite3` stores time-aligned frames, dialogue, boundaries,
   decisions, and cue positions.
+- `evaluation-report.json` records initial and extra Qwen attempts, seconds
+  spent on follow-ups, dropped duplicates, cue conflicts, and gaps with multiple
+  delivered cues.
 
 The job performs a CUDA preflight before loading the models. It records
 `CUDA_VISIBLE_DEVICES`, the PyTorch build, PyTorch's CUDA runtime, availability,

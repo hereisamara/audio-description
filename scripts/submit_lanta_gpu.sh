@@ -33,6 +33,12 @@ vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
 tts_model=${TTS_MODEL:-"$repo_dir/models/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
 evidence_frames=${EVIDENCE_FRAMES:-6}
+ad_plan=${AD_PLAN:-multi}
+event_followups=${EVENT_FOLLOWUPS:-2}
+timing_args=()
+if [[ -n "${QWEN_SECONDS_PER_CALL:-}" ]]; then
+  timing_args=(--qwen-seconds-per-call "$QWEN_SECONDS_PER_CALL")
+fi
 
 for required_path in "$input_video" "$asr_model" "$vlm_model" "$tts_model"; do
   if [[ ! -e "$required_path" ]]; then
@@ -73,6 +79,9 @@ conda run --no-capture-output -n "$conda_env" \
   --tts-backend transformers \
   --tts-model "$tts_model" \
   --evidence-frames "$evidence_frames" \
-  --maximum-gaps "$maximum_gaps"
+  --ad-plan "$ad_plan" \
+  --event-followups "$event_followups" \
+  --maximum-gaps "$maximum_gaps" \
+  "${timing_args[@]}"
 
 echo "Finished: $output_video"

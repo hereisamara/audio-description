@@ -33,6 +33,8 @@ from offline_ad_poc.pipeline import (
     merge_intervals,
     mix_described_video,
     normalize_event_payload,
+    plan_qwen_calls,
+    refine_gap_events,
     resize_frame_max_edge,
     sample_event_evidence_frames,
     segment_scenes,
@@ -216,6 +218,81 @@ class PipelineUnitTests(unittest.TestCase):
                 synthesize_decisions([late], Path(directory), "transformers", None, "model", "cpu", "ffprobe")
         self.assertEqual(late.decision, "WAIT")
         self.assertEqual(late.visual_proposals[2]["description"], "A man exits.")
+
+    @patch("offline_ad_poc.pipeline.sample_event_evidence_frames")
+    def test_event_comparison_spends_only_the_video_wide_budget(self, sample) -> None:
+        def near_window_edge(video, window, shots, scenes, boundaries, directory, **kwargs):
+            t = window.end - 0.4 if window.start in {0, 30} else window.start + 0.3
+            return [EvidenceFrame(str(directory / "image.jpg"), t, t, 1, 1)]
+
+        sample.side_effect = near_window_edge
+        backend = Qwen25Backend.__new__(Qwen25Backend)
+        event = {
+            "kind": "action", "important": True, "already_audible": False, "uncertain": False,
+            "frame_ids": [1], "ready_frame_id": 1, "description": "The man leaves the desk.",
+        }
+        adjacent = {**event, "description": "The man leaves the room."}
+        with (
+            patch.object(backend, "_generate", side_effect=map(json.dumps, [event, adjacent] * 2)),
+            patch.object(backend, "compare_events", return_value={"relation": "same"}) as compare,
+        ):
+            decisions = make_decisions(
+                Path("clip.mp4"), [Gap(0, 24, 60), Gap(30, 54, 60)], [], [], [], backend,
+                Path("frames"), 2, multi_event=True, followup_budget=1,
+            )
+        self.assertEqual(compare.call_count, 1)
+        self.assertEqual([item.gap_index for item in decisions], [1, 2, 2])
+        self.assertEqual(decisions[0].visual_followups[0]["relation"], "same")
+        self.assertEqual(decisions[1].visual_followups, [])
+
+    def test_qwen_call_plan_from_lanta_gap_lengths(self) -> None:
+        gaps = [
+            Gap(start, end) for start, end in [
+                (0.20, 53.27), (60.07, 61.69), (68.77, 74.19), (80.17, 87.89),
+                (119.77, 128.37), (146.93, 159.61), (164.67, 167.29),
+            ]
+        ]
+        plan = plan_qwen_calls(gaps, 12, 2, 4.8)
+        self.assertEqual(plan["initial_windows"], 12)
+        self.assertEqual(plan["max_calls_including_initial_retries"], 26)
+        self.assertAlmostEqual(plan["estimated_seconds_with_all_followups"], 67.2)
+
+    def test_late_proposal_can_use_earlier_supported_description(self) -> None:
+        late = {
+            "decision": "AD", "description": "The man walks across the room and exits.",
+            "description_ready_at": 9.6, "window_index": 1,
+        }
+        early = {**late, "description": "The man walks away.", "description_ready_at": 8.0, "window_index": 2}
+        def inspect(window, description):
+            self.assertLess(window.start, early["description_ready_at"])
+            self.assertEqual(description, late["description"])
+            return early
+
+        selected, reviews = refine_gap_events(
+            [late], Gap(0, 10, 25), Qwen25Backend.__new__(Qwen25Backend), inspect, 1, 6
+        )
+        self.assertEqual(selected, [early])
+        self.assertTrue(reviews[0]["used"])
+
+    def test_multi_event_tts_resolves_collision_and_keeps_separated_cue(self) -> None:
+        early = Decision(0, 14, "AD", "A woman rises.", "action", 0.5, 20, [],
+                         event_start=2, description_ready_at=2, preferred_cue_start=2.15)
+        priority = replace(early, description="A man enters.", importance=1,
+                           event_start=3, description_ready_at=3, preferred_cue_start=3.15)
+        later = replace(early, description="He picks up a letter.",
+                        event_start=8, description_ready_at=8, preferred_cue_start=8.15)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("offline_ad_poc.pipeline.resolve_tts_backend", return_value=("transformers", "model")),
+                patch("offline_ad_poc.pipeline.synthesize_text", return_value=Path("narration.wav")),
+                patch("offline_ad_poc.pipeline.probe_duration", return_value=4.0),
+            ):
+                synthesize_decisions([early, priority, later], Path(directory), "transformers",
+                                     None, "model", "cpu", "ffprobe")
+        self.assertEqual(early.placement_method, "rejected_cue_conflict")
+        self.assertTrue(priority.tts_path and later.tts_path)
+        self.assertLess(priority.cue_end, later.cue_start)
+        self.assertLess(later.cue_end, later.gap_end)
 
     def test_evidence_frame_resize_preserves_aspect_ratio_without_upscaling(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)

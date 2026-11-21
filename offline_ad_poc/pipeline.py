@@ -24,9 +24,10 @@ import wave
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
@@ -359,6 +360,8 @@ class Decision:
     description_ready_at: float | None = None
     visual_proposals: list[dict[str, Any]] = field(default_factory=list)
     selected_window: int | None = None
+    gap_index: int | None = None
+    visual_followups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run_command(args: Sequence[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -1589,7 +1592,14 @@ class Qwen25Backend(VisualBackend):
         timestamps = [frame.timestamp for frame in frames]
         attempts: list[dict[str, Any]] = []
         instruction = prompt
-        for _ in range(2):
+        if context.get("refine_description"):
+            prompt += (
+                "\nRecheck this specific event: " + json.dumps(context["refine_description"])
+                + ". Find a shorter description of the same action that the earliest available frame "
+                "clearly supports. Return kind=none if there is no such evidence."
+            )
+            instruction = prompt
+        for _ in range(1 if context.get("refine_description") else 2):
             try:
                 decoded = self._generate(frames, [*content, {"type": "text", "text": instruction}])
             except Exception as exc:
@@ -1611,6 +1621,36 @@ class Qwen25Backend(VisualBackend):
             attempts.append({"raw_output": decoded})
             return {**apply_ad_policy(proposal, timestamps), "proposal": proposal, "attempts": attempts}
         return {"decision": "WAIT", "reason": "invalid_vlm_output", "attempts": attempts}
+
+    def compare_events(
+        self, frames: Sequence[EvidenceFrame], split: int, left: str, right: str
+    ) -> dict[str, Any]:
+        content = []
+        for index, frame in enumerate(frames):
+            group = "A" if index < split else "B"
+            content.extend([
+                {"type": "text", "text": f"Event {group}."},
+                {"type": "image", "image": str(Path(frame.path).resolve())},
+            ])
+        content.append({
+            "type": "text",
+            "text": (
+                "Compare the two groups of film images. Do they show the same occurrence "
+                "of an action or two separate events? A new camera angle can continue an action. "
+                "Repeated actions at separate times are distinct. "
+                f"Candidate A: {json.dumps(left)}. Candidate B: {json.dumps(right)}. "
+                'Return only {"relation":"same"}, {"relation":"distinct"}, or '
+                '{"relation":"uncertain"} if the images cannot settle it.'
+            ),
+        })
+        decoded = self._generate(frames, content)
+        try:
+            relation = json_object_from_text(decoded).get("relation")
+            if relation not in ("same", "distinct", "uncertain"):
+                raise ValueError("Expected a valid event relation")
+        except ValueError as exc:
+            return {"relation": "uncertain", "raw_output": decoded, "validation_error": str(exc)}
+        return {"relation": relation, "raw_output": decoded}
 
     def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
         messages = [{"role": "user", "content": content}]
@@ -1783,6 +1823,108 @@ def split_evidence_windows(gap: Gap, maximum_seconds: float = 12.0) -> list[Gap]
     return [Gap(start, end, gap.word_budget) for start, end in zip(edges, edges[1:])]
 
 
+def plan_qwen_calls(
+    gaps: Sequence[Gap], maximum_gaps: int, followups: int, seconds_per_call: float | None
+) -> dict[str, Any]:
+    initial = sum(len(split_evidence_windows(gap)) for gap in gaps[:maximum_gaps])
+    extra = followups if initial else 0
+    plan = {
+        "initial_windows": initial,
+        "max_followup_calls": extra,
+        "max_calls_including_initial_retries": 2 * initial + extra,
+    }
+    if seconds_per_call is not None:
+        plan.update(
+            seconds_per_call=seconds_per_call,
+            estimated_initial_seconds=round(initial * seconds_per_call, 3),
+            estimated_seconds_with_all_followups=round((initial + extra) * seconds_per_call, 3),
+        )
+    return plan
+
+
+def refine_gap_events(
+    candidates: list[dict[str, Any]],
+    gap: Gap,
+    backend: VisualBackend,
+    inspect_window: Callable[[Gap, str], dict[str, Any]],
+    followup_budget: int,
+    frame_limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Review only nearby potential duplicates or events with a tight narration slot."""
+    kept: list[dict[str, Any]] = []
+    reviews: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if kept:
+            previous = kept[-1]
+            distance = candidate["event_start"] - previous["event_end"]
+            before = re.findall(r"\w+", previous["description"].casefold())
+            after = re.findall(r"\w+", candidate["description"].casefold())
+            similarity = SequenceMatcher(None, before, after, autojunk=False).ratio()
+            if distance <= 0.75 and before == after:
+                reviews.append({
+                    "kind": "duplicate_text", "kept_window": previous["window_index"],
+                    "discarded_window": candidate["window_index"], "calls": 0,
+                })
+                continue
+            if (
+                distance <= 4.0
+                and similarity >= 0.5
+                and sum(item["calls"] for item in reviews) < followup_budget
+            ):
+                groups = [
+                    [frame for frame in item["frames"] if frame["timestamp"] in item["evidence_timestamps"]]
+                    for item in (previous, candidate)
+                ]
+                left, right = [group[:max(1, frame_limit // 2)] for group in groups]
+                if left and right:
+                    frames = [EvidenceFrame(**{k: v for k, v in frame.items() if k != "id"}) for frame in left + right]
+                    started = time.perf_counter()
+                    try:
+                        result = backend.compare_events(
+                            frames, len(left), previous["description"], candidate["description"]
+                        )
+                    except Exception as exc:
+                        LOGGER.exception("vlm_event_comparison_failed")
+                        result = {"relation": "uncertain", "generation_error": str(exc)}
+                    reviews.append({
+                        "kind": "compare_events", "calls": 1,
+                        "elapsed_seconds": round(time.perf_counter() - started, 6),
+                        "windows": [previous["window_index"], candidate["window_index"]],
+                        "frame_paths": [frame.path for frame in frames],
+                        **result,
+                    })
+                    if result["relation"] == "same":
+                        continue
+        kept.append(candidate)
+
+    for index, candidate in enumerate(kept):
+        if sum(item["calls"] for item in reviews) >= followup_budget:
+            break
+        ready = candidate["description_ready_at"]
+        estimated = len(candidate["description"].split()) / 2.5
+        room = gap.end - ready - 0.075
+        earlier = max(gap.start, ready - 3.0)
+        if room >= estimated or ready - earlier < 0.5:
+            continue
+        budget = max(1, min(len(candidate["description"].split()), int((gap.end - earlier - 0.15) * 2.5)))
+        review_window = Gap(earlier, min(gap.end, ready + 0.25), budget)
+        started = time.perf_counter()
+        refined = inspect_window(review_window, candidate["description"])
+        use_refinement = (
+            refined.get("decision") == "AD"
+            and refined["description_ready_at"] < ready
+            and len(refined["description"].split()) / 2.5 <= gap.end - refined["description_ready_at"] - 0.075
+        )
+        reviews.append({
+            "kind": "earlier_support", "calls": 1, "source_window": candidate["window_index"],
+            "review_window": refined["window_index"], "used": use_refinement,
+            "elapsed_seconds": round(time.perf_counter() - started, 6),
+        })
+        if use_refinement:
+            kept[index] = refined
+    return kept, reviews
+
+
 def make_decisions(
     video_path: Path,
     gaps: Sequence[Gap],
@@ -1796,6 +1938,8 @@ def make_decisions(
     evidence_frames_per_gap: int = 6,
     soft_candidate_timestamps: Sequence[float] = (),
     knowledge_store: EvidenceStore | None = None,
+    multi_event: bool = False,
+    followup_budget: int = 0,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
@@ -1803,10 +1947,13 @@ def make_decisions(
         windows = split_evidence_windows(gap) if backend.uses_event_windows else [gap]
         proposals: list[dict[str, Any]] = []
         frames: list[EvidenceFrame] = []
-        selected_window = None
         gap_dir = frame_root / f"gap-{index:03d}"
-        for window_index, window in enumerate(windows, start=1):
+
+        def inspect_window(window: Gap, refine_description: str = "") -> dict[str, Any]:
+            window_index = len(proposals) + 1
             context = context_for_gap(window, shots, scenes, soft_candidate_timestamps)
+            if refine_description:
+                context["refine_description"] = refine_description
             evidence = sample_event_evidence_frames(
                 video_path,
                 window,
@@ -1837,75 +1984,76 @@ def make_decisions(
                 }
             proposals.append({
                 "window_index": window_index,
+                "scan": "timing_followup" if refine_description else "initial",
                 "start": window.start,
                 "end": window.end,
                 "frames": [{"id": i, **asdict(frame)} for i, frame in enumerate(evidence, start=1)],
                 **proposal,
             })
             frames.extend(evidence)
-            if selected_window is None and proposal.get("decision") == "AD":
-                selected_window = window_index
-        if selected_window is not None:
-            payload = proposals[selected_window - 1]
-        elif len(proposals) == 1:
-            payload = proposals[0]
-        else:
-            payload = {"decision": "WAIT", "reason": "no_eligible_event_in_gap"}
-        if not backend.uses_event_windows:
-            payload = normalize_event_payload(payload, frames, gap)
-        decision_name = str(payload.get("decision", "WAIT")).upper()
-        if decision_name not in {"AD", "WAIT"}:
-            decision_name = "WAIT"
-        description = str(payload.get("description", "")).strip() if decision_name == "AD" else ""
-        description = limit_words(description, gap.word_budget) if description else ""
-        if decision_name == "AD" and not description:
-            decision_name = "WAIT"
-        if decision_name == "WAIT":
-            payload.update(
-                event_start=None,
-                event_end=None,
-                evidence_timestamps=[],
-                event_timing_source="none",
+            return proposals[-1]
+
+        eligible = [item for item in map(inspect_window, windows) if item.get("decision") == "AD"]
+        reviews = []
+        if multi_event and backend.uses_event_windows:
+            eligible, reviews = refine_gap_events(
+                eligible, gap, backend, inspect_window, followup_budget, evidence_frames_per_gap
             )
-        ready_at = _coerce_timestamp(payload.get("description_ready_at"))
-        event_start = _coerce_timestamp(payload.get("event_start"))
-        anchor = ready_at if ready_at is not None else event_start
-        decision = Decision(
-            gap_start=gap.start,
-            gap_end=gap.end,
-            decision=decision_name,
-            description=description,
-            reason=str(payload.get("reason", "")),
-            importance=float(payload.get("importance", 0.0)),
-            word_budget=gap.word_budget,
-            evidence_frames=[frame.path for frame in frames],
-            evidence_timestamps=[float(value) for value in payload.get("evidence_timestamps", [])],
-            event_start=event_start,
-            event_end=_coerce_timestamp(payload.get("event_end")),
-            event_timing_source=str(payload.get("event_timing_source", "none")),
-            preferred_cue_start=anchor + 0.15 if anchor is not None else None,
-            description_ready_at=ready_at,
-            visual_proposals=proposals,
-            selected_window=selected_window,
-        )
-        decisions.append(decision)
-        LOGGER.info(
-            "ad_decision gap=%d decision=%s event_start=%s event_end=%s timing_source=%s "
-            "evidence_timestamps=%s importance=%.3f reason=%s",
-            index,
-            decision.decision,
-            decision.event_start,
-            decision.event_end,
-            decision.event_timing_source,
-            decision.evidence_timestamps,
-            decision.importance,
-            decision.reason.replace("\n", " "),
-        )
-        if knowledge_store is not None:
-            knowledge_store.record_decision(index, decision)
-        if decision.decision == "AD":
-            previous_ad.append(decision.description)
+            followup_budget -= sum(item["calls"] for item in reviews)
+        else:
+            eligible = eligible[:1]
+        if not eligible:
+            eligible = [proposals[0] if len(proposals) == 1 else {"decision": "WAIT", "reason": "no_eligible_event_in_gap"}]
+        for position, payload in enumerate(eligible):
+            decision = decision_from_proposal(gap, payload, frames, index, backend.uses_event_windows)
+            if position == 0:
+                decision.visual_proposals = proposals
+                decision.visual_followups = reviews
+            decisions.append(decision)
+            LOGGER.info(
+                "ad_decision gap=%d window=%s decision=%s timing_source=%s ready_at=%s reason=%s",
+                index, decision.selected_window, decision.decision, decision.event_timing_source,
+                decision.description_ready_at, decision.reason,
+            )
+            if knowledge_store is not None:
+                knowledge_store.record_decision(len(decisions), decision)
+            if decision.decision == "AD":
+                previous_ad.append(decision.description)
     return decisions
+
+
+def decision_from_proposal(
+    gap: Gap, proposal: dict[str, Any], frames: Sequence[EvidenceFrame], gap_index: int, grounded: bool
+) -> Decision:
+    payload = proposal if grounded else normalize_event_payload(proposal, frames, gap)
+    description = ""
+    if str(payload.get("decision", "WAIT")).upper() == "AD":
+        description = limit_words(str(payload.get("description", "")).strip(), gap.word_budget)
+    is_ad = bool(description)
+    ready_at = _coerce_timestamp(payload.get("description_ready_at")) if is_ad else None
+    event_start = _coerce_timestamp(payload.get("event_start")) if is_ad else None
+    anchor = ready_at if ready_at is not None else event_start
+    return Decision(
+        gap_start=gap.start,
+        gap_end=gap.end,
+        decision="AD" if is_ad else "WAIT",
+        description=description,
+        reason=str(payload.get("reason", "")),
+        importance=float(payload.get("importance", 0.0)),
+        word_budget=gap.word_budget,
+        evidence_frames=(
+            [frame["path"] for frame in payload.get("frames", [])]
+            if is_ad and grounded else [frame.path for frame in frames]
+        ),
+        evidence_timestamps=list(payload.get("evidence_timestamps", [])) if is_ad else [],
+        event_start=event_start,
+        event_end=_coerce_timestamp(payload.get("event_end")) if is_ad else None,
+        event_timing_source=str(payload.get("event_timing_source", "none")) if is_ad else "none",
+        preferred_cue_start=anchor + 0.15 if anchor is not None else None,
+        description_ready_at=ready_at,
+        selected_window=payload.get("window_index") if is_ad else None,
+        gap_index=gap_index,
+    )
 
 
 def resolve_tts_backend(
@@ -2012,6 +2160,7 @@ def choose_event_aware_cue_start(
     narration_duration: float,
     safety_margin: float = 0.075,
     maximum_anticipation: float = 0.35,
+    occupied: Sequence[Interval] = (),
 ) -> tuple[float | None, str]:
     """Choose a safe cue near the visual event without narrating it too early."""
     earliest = decision.gap_start + safety_margin
@@ -2025,10 +2174,27 @@ def choose_event_aware_cue_start(
     ready_at = decision.description_ready_at
     if preferred is None:
         preferred = (ready_at if ready_at is not None else decision.event_start) + 0.15
-    cue_start = min(max(preferred, earliest), latest)
     minimum_start = ready_at if ready_at is not None else decision.event_start - maximum_anticipation
-    if cue_start < minimum_start:
+    earliest = max(earliest, minimum_start)
+    if latest < earliest:
         return None, "no_post_event_fit"
+    cue_start = min(max(preferred, earliest), latest)
+    if occupied:
+        # A second cue can move slightly to fit, while staying near its evidence.
+        latest = min(latest, preferred + 2.5)
+        candidates = []
+        for prior in sorted(occupied, key=lambda item: item.start):
+            end_before_prior = min(latest, prior.start - safety_margin - narration_duration)
+            if earliest <= end_before_prior:
+                candidates.append(min(max(preferred, earliest), end_before_prior))
+            earliest = max(earliest, prior.end + safety_margin)
+        if earliest <= latest:
+            candidates.append(min(max(preferred, earliest), latest))
+        if not candidates:
+            return None, "cue_conflict"
+        new_start = min(candidates, key=lambda start: (abs(start - preferred), start))
+        if not math.isclose(new_start, cue_start, abs_tol=0.001):
+            return new_start, "event_shifted_around_other_cue"
     if math.isclose(cue_start, preferred, abs_tol=0.001):
         method = "event_aligned"
     elif cue_start < preferred:
@@ -2049,10 +2215,19 @@ def synthesize_decisions(
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
-    for index, decision in enumerate(decisions, start=1):
+    occupied_by_gap: dict[tuple[float, float], list[Interval]] = {}
+    priority = sorted(
+        enumerate(decisions, start=1),
+        key=lambda item: (
+            item[1].gap_start, -item[1].importance,
+            item[1].preferred_cue_start if item[1].preferred_cue_start is not None else item[1].gap_start,
+        ),
+    )
+    for index, decision in priority:
         if decision.decision != "AD":
             continue
         text = decision.description
+        occupied = occupied_by_gap.setdefault((decision.gap_start, decision.gap_end), [])
         available = max(0.25, decision.gap_end - decision.gap_start - 0.15)
         for attempt in range(4):
             audio_path = synthesize_text(
@@ -2064,7 +2239,7 @@ def synthesize_decisions(
                 device,
             )
             duration = probe_duration(audio_path, ffprobe)
-            cue_start, placement_method = choose_event_aware_cue_start(decision, duration)
+            cue_start, placement_method = choose_event_aware_cue_start(decision, duration, occupied=occupied)
             if duration <= available and cue_start is not None:
                 decision.description = text
                 decision.tts_path = str(audio_path)
@@ -2072,6 +2247,7 @@ def synthesize_decisions(
                 decision.cue_start = cue_start
                 decision.cue_end = decision.cue_start + duration
                 decision.placement_method = placement_method
+                occupied.append(Interval(decision.cue_start, decision.cue_end))
                 LOGGER.info(
                     "ad_placement decision=%d gap=%.3f-%.3f event=%.3f-%.3f "
                     "cue=%.3f-%.3f method=%s tts_duration=%.3f",
@@ -2104,9 +2280,14 @@ def synthesize_decisions(
             text = limit_words(text, max(2, min(target, len(words) - 1)))
         if not decision.tts_path:
             decision.decision = "WAIT"
-            decision.reason = "TTS could not fit a safe post-event slot"
+            decision.reason = (
+                "TTS conflicts with a higher-priority cue"
+                if placement_method == "cue_conflict" else "TTS could not fit a safe post-event slot"
+            )
             decision.description = ""
-            decision.placement_method = "rejected_no_safe_event_slot"
+            decision.placement_method = (
+                "rejected_cue_conflict" if placement_method == "cue_conflict" else "rejected_no_safe_event_slot"
+            )
     return backend, decisions
 
 
@@ -2120,7 +2301,7 @@ def vtt_timestamp(seconds: float) -> str:
 
 def write_vtt(decisions: Sequence[Decision], output: Path) -> None:
     lines = ["WEBVTT", ""]
-    for decision in decisions:
+    for decision in sorted(decisions, key=lambda item: item.cue_start):
         if decision.decision != "AD" or not decision.tts_path:
             continue
         lines.extend(
@@ -2265,17 +2446,32 @@ def evaluate(
         if item.event_start is not None
     ]
     windows = [window for decision in decisions for window in decision.visual_proposals]
+    reviews = [review for decision in decisions for review in decision.visual_followups]
+    cue_counts: dict[tuple[float, float], int] = {}
+    for item in active:
+        key = (item.gap_start, item.gap_end)
+        cue_counts[key] = cue_counts.get(key, 0) + 1
     return {
         "duration_seconds": round(media.duration, 3),
         "shots": len(shots),
         "scenes": len(scenes),
         "candidate_gaps": len(gaps),
-        "processed_gaps": len(decisions),
+        "processed_gaps": sum(bool(item.visual_proposals) for item in decisions),
         "accepted_ad_events": len(active),
+        "gaps_with_multiple_ad_events": sum(count > 1 for count in cue_counts.values()),
         "wait_events": sum(item.decision == "WAIT" for item in decisions),
         "event_grounded_ad_events": sum(item.event_start is not None for item in active),
         "frame_id_grounded_ad_events": sum(item.event_timing_source == "model_frame_ids" for item in active),
-        "visual_windows_evaluated": len(windows),
+        "visual_windows_evaluated": sum(window["scan"] == "initial" for window in windows),
+        "first_pass_qwen_attempts": sum(
+            len(window.get("attempts", [])) for window in windows if window["scan"] == "initial"
+        ),
+        "followup_qwen_attempts": sum(review["calls"] for review in reviews),
+        "followup_elapsed_seconds": round(sum(review.get("elapsed_seconds", 0.0) for review in reviews), 3),
+        "duplicate_proposals_removed": sum(
+            review["kind"] == "duplicate_text" or review.get("relation") == "same"
+            for review in reviews
+        ),
         "invalid_vlm_windows": sum(window["reason"] == "invalid_vlm_output" for window in windows),
         "vlm_generation_failed_windows": sum(window["reason"] == "vlm_generation_failure" for window in windows),
         "vlm_retried_windows": sum(len(window.get("attempts", [])) > 1 for window in windows),
@@ -2285,6 +2481,7 @@ def evaluate(
         "rejected_no_safe_event_slot": sum(
             item.placement_method == "rejected_no_safe_event_slot" for item in decisions
         ),
+        "rejected_cue_conflict": sum(item.placement_method == "rejected_cue_conflict" for item in decisions),
         "mean_cue_start_offset_from_event_seconds": (
             round(sum(event_offsets) / len(event_offsets), 4) if event_offsets else None
         ),
@@ -2328,6 +2525,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
+    parser.add_argument("--ad-plan", choices=["single", "multi"], default="multi",
+                        help="Choose one proposal or schedule multiple events per speech gap")
+    parser.add_argument("--event-followups", type=int, default=2,
+                        help="Maximum extra Qwen calls per video for multi-event refinement")
+    parser.add_argument("--qwen-seconds-per-call", type=float,
+                        help="Optional measured per-call time for a planning estimate")
     parser.add_argument(
         "--dialogue-filter",
         choices=["timestamp", "none"],
@@ -2361,6 +2564,12 @@ def main() -> None:
         raise ValueError("--evidence-max-edge must be zero or a positive integer")
     if args.evidence_frames < 3:
         raise ValueError("--evidence-frames must be at least 3")
+    if args.event_followups < 0:
+        raise ValueError("--event-followups must be zero or a positive integer")
+    if args.qwen_seconds_per_call is not None and (
+        not math.isfinite(args.qwen_seconds_per_call) or args.qwen_seconds_per_call <= 0
+    ):
+        raise ValueError("--qwen-seconds-per-call must be finite and positive")
     started = time.perf_counter()
     input_video = args.input.resolve()
     output_video = args.output_video.resolve()
@@ -2537,6 +2746,13 @@ def main() -> None:
             soft_candidates=len(soft_candidate_timestamps),
         )
 
+    qwen_plan = None
+    if args.visual_backend == "qwen25":
+        qwen_plan = plan_qwen_calls(
+            gaps, args.maximum_gaps, args.event_followups if args.ad_plan == "multi" else 0,
+            args.qwen_seconds_per_call,
+        )
+        LOGGER.info("qwen_call_plan %s", json.dumps(qwen_plan))
     visual_compute_device = device if args.visual_backend == "qwen25" else "cpu"
     with profiler.stage(
         "visual_backend_initialization",
@@ -2550,6 +2766,8 @@ def main() -> None:
         compute_device=visual_compute_device,
         evidence_max_edge=args.evidence_max_edge or "source",
         evidence_frames_per_window=args.evidence_frames,
+        ad_plan=args.ad_plan,
+        event_followup_budget=args.event_followups if args.ad_plan == "multi" and backend.uses_event_windows else 0,
         evidence_sampling="temporal_windows" if backend.uses_event_windows else "adaptive_visual_change_and_boundaries",
     ) as stage:
         decisions = make_decisions(
@@ -2565,23 +2783,34 @@ def main() -> None:
             args.evidence_frames,
             soft_candidate_timestamps,
             knowledge_store,
+            multi_event=args.ad_plan == "multi",
+            followup_budget=args.event_followups,
         )
         stage.update(
-            processed_gaps=len(decisions),
+            processed_gaps=sum(bool(item.visual_proposals) for item in decisions),
+            followup_qwen_attempts=sum(
+                review["calls"] for item in decisions for review in item.visual_followups
+            ),
             ad_decisions=sum(item.decision == "AD" for item in decisions),
             wait_decisions=sum(item.decision == "WAIT" for item in decisions),
             **backend.runtime_metrics(),
         )
     with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
-        write_json(work_dir / "ad-proposals.json", [
-            {
-                "gap_start": item.gap_start,
-                "gap_end": item.gap_end,
-                "selected_window": item.selected_window,
-                "windows": item.visual_proposals,
-            }
-            for item in decisions
-        ])
+        plan_by_gap: dict[int | None, dict[str, Any]] = {}
+        for item in decisions:
+            if item.visual_proposals:
+                plan_by_gap[item.gap_index] = {
+                    "gap_index": item.gap_index,
+                    "gap_start": item.gap_start,
+                    "gap_end": item.gap_end,
+                    "selected_window": item.selected_window,
+                    "selected_windows": [],
+                    "windows": item.visual_proposals,
+                    "followups": item.visual_followups,
+                }
+            if item.selected_window is not None:
+                plan_by_gap[item.gap_index]["selected_windows"].append(item.selected_window)
+        write_json(work_dir / "ad-proposals.json", list(plan_by_gap.values()))
     tts_compute_device = (
         device
         if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
@@ -2647,7 +2876,7 @@ def main() -> None:
         write_json(work_dir / "shot-boundary-validation.json", shot_validation)
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
         write_json(work_dir / "ad-decisions.json", [
-            {key: value for key, value in vars(item).items() if key != "visual_proposals"}
+            {key: value for key, value in vars(item).items() if key not in {"visual_proposals", "visual_followups"}}
             for item in decisions
         ])
 
@@ -2662,6 +2891,7 @@ def main() -> None:
             "output": str(output_video),
             "device": device,
             "visual_backend": args.visual_backend,
+            "qwen_call_plan": qwen_plan,
             "tts_backend": tts_backend,
             "offline": not args.allow_model_download,
             "runtime_log": str(work_dir / "runtime.log"),
