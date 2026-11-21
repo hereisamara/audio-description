@@ -1,6 +1,6 @@
 # Audio Description POC: Experiment and Progress Record
 
-Last updated: 2026-11-19
+Last updated: 2026-11-21
 
 This document records what was attempted, why it was attempted, what evidence
 was produced, how it helped, why the preceding approach was insufficient, and
@@ -721,6 +721,124 @@ while still finishing before dialogue resumes.
 The scheduler uses local micro-events rather than treating scene IDs as gates.
 Correct shot/scene results improve its evidence, but a globally merged scene
 does not prevent local action detection or placement.
+
+### 16. First event-aware Lanta validation
+
+**Status:** Completed run; placement mechanism validated, decision quality still
+requires correction
+
+**Run information**
+
+- Date: 2026-11-19
+- Slurm job: `6694977`
+- Git implementation: `f0bb7b7`
+- Input duration: 178.584 seconds
+- Output: `outputs/real-scene-01-event-aware-v1-ad.mp4`
+- Work directory: `outputs/real-scene-01-event-aware-v1-work`
+- Evidence-frame limit: 6 per candidate gap
+
+**Result summary**
+
+- total processing time: 123.167 seconds;
+- real-time factor: 0.6897;
+- 7 candidate gaps were processed;
+- 1 final AD event was accepted;
+- 1 initially accepted event was rejected because no safe post-event TTS slot
+  remained;
+- 0 seconds of measured dialogue overlap;
+- 1 event-aligned cue;
+- mean cue-start offset from recorded event: 0.150 seconds;
+- SQLite indexing/finalization added only about 0.048 seconds;
+- Qwen decisions took 33.583 seconds for seven gaps and six frames per gap;
+- peak Qwen decision allocation was approximately 7688 MB.
+
+**Accepted AD event**
+
+- candidate gap: 146.930–159.610 seconds;
+- description: "the man walks away from the desk and out of the room.";
+- evidence timestamps: 145.946, 146.913, 147.781, 148.548, 151.451,
+  and 159.559 seconds;
+- recorded event timestamp: 148.548 seconds;
+- cue: 148.698–152.346 seconds;
+- TTS duration: 3.648 seconds;
+- placement method: `event_aligned`.
+
+Frame inspection showed the man beginning to leave around 146.913 seconds,
+continuing through the cut at 148.548 seconds, and being gone by 151.451
+seconds. The narration therefore overlaps the visible action and ends shortly
+after the exit. This is materially better than centering the sentence in the
+entire 12.68-second gap.
+
+**Important limitation of the accepted event**
+
+Qwen did not return the requested event timestamp. The pipeline selected
+148.548 seconds through `highest_salience_evidence_frame`; that timestamp is a
+hard cut inside the action, not the verified beginning of the action. Placement
+worked, but model-grounded temporal localization was not validated.
+
+**Other decision problems exposed**
+
+1. Four gaps returned `WAIT` with importance 0.9 and reasons that described
+   visible actions rather than explaining why AD was unnecessary. These outputs
+   are internally inconsistent.
+2. Gap 4 failed because Qwen output contained no parseable JSON object.
+3. Both initially accepted AD decisions omitted usable model timestamps and
+   required the salience fallback.
+4. Gap 7 repeated the leaving action near 166.733 seconds instead of recognizing
+   it as already described; it was ultimately rejected only because TTS could
+   not fit safely.
+5. The 53.07-second first gap selected frames heavily around early title cuts
+   and the cut at 49.783 seconds. Six frames did not preserve adequate temporal
+   coverage of the long interval, including the action previously observed near
+   31.72 seconds.
+6. When TTS rejects a proposed event, the final decision currently overwrites
+   the proposed description and reason, reducing auditability.
+
+**Runtime interpretation**
+
+The total was 11.385 seconds lower than the earlier 134.552-second profiled run,
+but this is not a controlled speed comparison because gap count and decision
+work changed. ASR decreased from 88.797 to 57.167 seconds, while Qwen decision
+time increased from 6.975 to 33.583 seconds because seven gaps and more frames
+were processed.
+
+**Decision from this experiment**
+
+Keep the event-aware TTS scheduler and SQLite evidence store. Before evaluating
+description quality again:
+
+1. preserve temporal coverage in long gaps by selecting evidence per time bin
+   or processing bounded micro-windows;
+2. request frame identifiers rather than floating-point timestamps and map the
+   returned IDs to timestamps in code;
+3. add one structured-output repair retry and log the raw model output;
+4. reject or retry contradictory high-importance `WAIT` outputs;
+5. preserve the original model proposal separately from the final post-TTS
+   decision;
+6. compare each new cue with human AD timing after these output-contract fixes.
+
+### 17. Phase 1 visual decisions
+
+**Status:** Implemented on `ad-decision-phase-1`. Qwen evaluation on Lanta is pending.
+
+Job `6694977` concentrated six images near the edges of the 53-second opening
+gap. Both AD proposals also relied on salience for timing, and one response
+failed JSON parsing. The new sampler gives each consecutive window of up to
+12 seconds its own frame budget, so the middle of the gap gets reviewed.
+
+Qwen now proposes a visual event with numbered supporting frames and the first
+frame that supports the full description. Python validates those IDs, retries
+one invalid response, and applies the AD policy based on importance,
+uncertainty, and whether dialogue already communicates the event. The window
+audit is written before TTS to `ad-proposals.json`. Timing comes from the
+cited frames, and narration must start at or after the description-ready
+frame. The earliest eligible window supplies one proposal per speech gap.
+
+All 27 Conda tests passed. A local scan of the real opening covered all five
+windows and selected a frame at 31.999 seconds. On Lanta, compare job
+`6694977` with the new run using the same clip, models and per-call frame
+count. Review frame-ID-grounded cues, retry and failure counts, dialogue
+overlap, Qwen time, and peak GPU memory.
 
 ## Next experiment order
 

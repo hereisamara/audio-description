@@ -217,10 +217,17 @@ The pipeline also writes a dedicated live log inside the work directory:
 tail -f outputs/real-scene-01-work/runtime.log
 ```
 
-For every gap, the runtime log lists the selected frame timestamps, salience,
-shot/scene references, grounded VLM event interval, final cue interval, and
-placement method. `evidence-knowledge.sqlite3` stores the same time-aligned
-frames, dialogue, boundaries, decisions, and cue positions for later analysis.
+For Qwen runs, each dialogue gap is covered by consecutive windows of at most
+12 seconds. `EVIDENCE_FRAMES` caps the images per Qwen call. The pipeline scans
+the windows sequentially and advances the first eligible proposal from each
+gap to TTS. More windows can increase the total inference time.
+
+- `ad-proposals.json` records every window, frame ID and timestamp, raw model
+  output, validation error, and the proposal selected before TTS.
+- `ad-decisions.json` records the final outcome, including the selected window,
+  description-ready timestamp and cue placement.
+- `evidence-knowledge.sqlite3` stores time-aligned frames, dialogue, boundaries,
+  decisions, and cue positions.
 
 The job performs a CUDA preflight before loading the models. It records
 `CUDA_VISIBLE_DEVICES`, the PyTorch build, PyTorch's CUDA runtime, availability,
@@ -345,7 +352,7 @@ pipeline sweep below.
 ### Full-pipeline resolution sweep
 
 The resolution sweep runs the same video at four evidence-frame sizes while
-keeping the model, adaptive six-frame limit, prompt, audio, and pipeline
+keeping the model, six-frame limit per window, prompt, audio, and pipeline
 parameters fixed. For a 640x480 source, the defaults test long edges of 160,
 320, 480, and 640 pixels. The sampler never upscales a source frame, so do not
 add 720 or 1080 to a 640x480 source: those settings cannot add visual

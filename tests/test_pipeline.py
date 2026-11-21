@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from offline_ad_poc.pipeline import (
     Interval,
     Decision,
     EvidenceFrame,
+    Qwen25Backend,
     RuntimeProfiler,
     Scene,
     Shot,
@@ -27,6 +29,7 @@ from offline_ad_poc.pipeline import (
     evidence_candidate_timestamps,
     expand_qwen_image_tokens,
     limit_words,
+    make_decisions,
     merge_intervals,
     mix_described_video,
     normalize_event_payload,
@@ -34,6 +37,7 @@ from offline_ad_poc.pipeline import (
     sample_event_evidence_frames,
     segment_scenes,
     speech_intervals_from_words,
+    synthesize_decisions,
     validate_whisper_word_timestamps,
     validate_shot_timeline,
 )
@@ -139,7 +143,79 @@ class PipelineUnitTests(unittest.TestCase):
             [[1, 4, 4], [1, 2, 4]],
             merge_size=2,
         )
-        self.assertEqual(expanded.count("<|image_pad|>"), 6)
+        self.assertEqual(
+            expanded, f"start {'<|image_pad|>' * 4} middle {'<|image_pad|>' * 2} end"
+        )
+        with self.assertRaises(ValueError):
+            expand_qwen_image_tokens("<|image_pad|>", "<|image_pad|>", [[1, 4, 4]] * 2, 2)
+
+    def test_visual_event_retry_preserves_outputs_and_rejects_context_ids(self) -> None:
+        backend = Qwen25Backend.__new__(Qwen25Backend)
+        frames = [EvidenceFrame("context.jpg", 0, 0, 1, 1), EvidenceFrame("event.jpg", 2, 2, 1, 1)]
+        proposal = {
+            "kind": "action", "important": True, "already_audible": False, "uncertain": False,
+            "frame_ids": [2], "ready_frame_id": 2, "description": "A woman stands.",
+        }
+        invalid = json.dumps({**proposal, "frame_ids": [1], "ready_frame_id": 1})
+        with patch.object(backend, "_generate", side_effect=[invalid, json.dumps(proposal)]) as generate:
+            result = backend.decide(frames, Gap(1, 4, 8), "", [], {})
+        self.assertEqual(result["decision"], "AD")
+        self.assertEqual(result["event_start"], 2)
+        self.assertEqual(result["event_timing_source"], "model_frame_ids")
+        self.assertEqual(result["attempts"][0]["raw_output"], invalid)
+        self.assertIn("failed validation", generate.call_args.args[1][-1]["text"])
+
+        with patch.object(backend, "_generate", side_effect=["Not JSON", invalid]) as generate:
+            result = backend.decide(frames, Gap(1, 4, 8), "", [], {})
+        self.assertEqual(result["reason"], "invalid_vlm_output")
+        self.assertEqual(generate.call_count, 2)
+        self.assertNotIn("event_start", result)
+
+        with patch.object(backend, "_generate", return_value=json.dumps({**proposal, "already_audible": True})):
+            result = backend.decide(frames, Gap(1, 4, 8), "", [], {})
+        self.assertEqual(result["reason"], "already_communicated_by_dialogue")
+
+    @patch("offline_ad_poc.pipeline.sample_event_evidence_frames")
+    def test_long_gap_evaluates_middle_window_and_places_from_first_complete_frame(self, sample) -> None:
+        def sample_midpoint(video, window, shots, scenes, boundaries, directory, **kwargs):
+            midpoint = (window.start + window.end) / 2
+            return [
+                EvidenceFrame(str(directory / "action.jpg"), midpoint, midpoint, 1, 1),
+                EvidenceFrame(str(directory / "ready.jpg"), midpoint + 2, midpoint + 2, 1, 1),
+            ]
+
+        sample.side_effect = sample_midpoint
+        backend = Qwen25Backend.__new__(Qwen25Backend)
+        no_event = {
+            "kind": "none", "important": False, "already_audible": False, "uncertain": False,
+            "frame_ids": [], "ready_frame_id": None, "description": "",
+        }
+        event = {
+            **no_event, "kind": "action", "important": True,
+            "frame_ids": [1, 2], "ready_frame_id": 2, "description": "A man exits.",
+        }
+        responses = [no_event, no_event, event, no_event, no_event]
+        with patch.object(backend, "_generate", side_effect=map(json.dumps, responses)):
+            [decision] = make_decisions(
+                Path("clip.mp4"), [Gap(0.2, 53.27, 132)], [], [], [], backend, Path("frames"), 1
+            )
+        self.assertEqual(sample.call_count, 5)
+        self.assertEqual(decision.selected_window, 3)
+        self.assertTrue(any(item["start"] <= 31.72 < item["end"] for item in decision.visual_proposals))
+        cue, method = choose_event_aware_cue_start(decision, 3.0)
+        self.assertAlmostEqual(cue, decision.description_ready_at + 0.15)
+        self.assertEqual(method, "event_aligned")
+
+        late = replace(decision, gap_end=decision.description_ready_at + 0.5)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("offline_ad_poc.pipeline.resolve_tts_backend", return_value=("transformers", "model")),
+                patch("offline_ad_poc.pipeline.synthesize_text", return_value=Path("narration.wav")),
+                patch("offline_ad_poc.pipeline.probe_duration", return_value=3.0),
+            ):
+                synthesize_decisions([late], Path(directory), "transformers", None, "model", "cpu", "ffprobe")
+        self.assertEqual(late.decision, "WAIT")
+        self.assertEqual(late.visual_proposals[2]["description"], "A man exits.")
 
     def test_evidence_frame_resize_preserves_aspect_ratio_without_upscaling(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)

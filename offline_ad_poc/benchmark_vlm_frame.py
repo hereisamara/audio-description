@@ -192,8 +192,11 @@ def main() -> None:
             "description": description,
             "reason": str(payload.get("reason", "")),
             "importance": float(payload.get("importance", 0.0)),
-            "valid_output": decision == "WAIT" or bool(description),
-            "outputs_consistent": all(item == payload for item in payloads),
+            "valid_output": "proposal" in payload,
+            "outputs_consistent": all(
+                item.get("proposal") == payload.get("proposal") and item["decision"] == decision
+                for item in payloads
+            ),
             "image": str(image_path),
             "samples": samples,
         }
