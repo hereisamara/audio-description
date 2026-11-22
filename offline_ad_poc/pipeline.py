@@ -32,7 +32,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 import cv2
 import numpy as np
 
-from .ad_preparer import build_qwen_cue_input, prepare_ad_cues, run_qwen_cue
+from .ad_preparer import build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from .knowledge_db import EvidenceStore
 from .smolvlm import DEFAULT_MAX_NEW_TOKENS
 from .visual_events import apply_ad_policy, direct_ad_text, validate_visual_event
@@ -358,6 +358,7 @@ class Decision:
     placement_method: str = "unplaced"
     tts_path: str = ""
     tts_duration: float = 0.0
+    tts_attempts: list[dict[str, Any]] = field(default_factory=list)
     cue_start: float = 0.0
     cue_end: float = 0.0
     description_ready_at: float | None = None
@@ -1626,12 +1627,16 @@ class Qwen25Backend(VisualBackend):
             "Supply one or two concise, factual sentences as visual evidence for an audio-description editor. "
             if defer_word_budget else f"Keep description to {word_limit} words or fewer. "
         )
+        history_instruction = (
+            f"Earlier proposed narration: {' | '.join(previous_ad[-3:]) or 'none'}."
+            if not context.get("defer_word_budget") else ""
+        )
         prompt = (
             "Identify the strongest new visible event or informative detail in the numbered film images. "
             "A cut alone is not an event. Describe only supported facts in the present tense. "
             "Set important=true when the detail helps someone follow the film. "
             "Set already_audible=true when the dialogue communicates the same information. "
-            "Use earlier proposed narration to recognize repeated content. "
+            "Identify each object from the current numbered images. Dialogue may help identify a visible object. "
             "Return one JSON object using this example and no additional text: "
             '{"kind":"action","important":true,"already_audible":false,"uncertain":false,'
             '"frame_ids":[2,3],"ready_frame_id":3,"description":"A woman stands."} '
@@ -1643,7 +1648,7 @@ class Qwen25Backend(VisualBackend):
             "For kind=none use important=false, frame_ids=[], ready_frame_id=null, description=\"\". "
             f"{description_instruction}"
             f"Recent dialogue: {transcript or 'none'}. "
-            f"Earlier proposed narration: {' | '.join(previous_ad[-3:]) or 'none'}."
+            f"{history_instruction}"
         )
         content: list[dict[str, Any]] = []
         for index, frame in enumerate(frames, start=1):
@@ -1976,7 +1981,8 @@ def refine_gap_events(
         ready = candidate["description_ready_at"]
         estimated = len(candidate["description"].split()) / 2.5
         room = gap.end - ready - 0.075
-        earlier = max(gap.start, ready - 3.0)
+        event_start = candidate.get("event_start", ready)
+        earlier = max(gap.start, ready - 6.0, min(ready - 3.0, event_start))
         if room >= estimated or ready - earlier < 0.5:
             continue
         budget = max(1, min(len(candidate["description"].split()), int((gap.end - earlier - 0.15) * 2.5)))
@@ -2164,6 +2170,8 @@ def record_ad_outcomes(
                         outcome.update(stage="tts_and_placement", reason=item.reason)
                     else:
                         outcome.update(stage="ad_preparation", reason=item.reason or "ad_preparer_wait")
+                    if item.tts_attempts:
+                        outcome["tts_attempts"] = item.tts_attempts
             window["outcome"] = outcome
         gap.update(status="ad_added" if cue_count else "no_ad",
                    reason="cue_placed" if cue_count else "no_cue_from_windows",
@@ -2307,10 +2315,26 @@ def probe_duration(path: Path, ffprobe: str) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
+NARRATION_MARGIN = 0.075
+
+
+def earliest_narration_start(decision: Decision, safety_margin: float = NARRATION_MARGIN,
+                             maximum_anticipation: float = 0.35) -> float:
+    earliest = decision.gap_start + safety_margin
+    if decision.event_start is not None:
+        ready = decision.description_ready_at
+        earliest = max(earliest, ready if ready is not None else decision.event_start - maximum_anticipation)
+    return earliest
+
+
+def narration_seconds_after_anchor(decision: Decision) -> float:
+    return max(0.0, decision.gap_end - NARRATION_MARGIN - earliest_narration_start(decision))
+
+
 def choose_event_aware_cue_start(
     decision: Decision,
     narration_duration: float,
-    safety_margin: float = 0.075,
+    safety_margin: float = NARRATION_MARGIN,
     maximum_anticipation: float = 0.35,
     occupied: Sequence[Interval] = (),
 ) -> tuple[float | None, str]:
@@ -2326,8 +2350,7 @@ def choose_event_aware_cue_start(
     ready_at = decision.description_ready_at
     if preferred is None:
         preferred = (ready_at if ready_at is not None else decision.event_start) + 0.15
-    minimum_start = ready_at if ready_at is not None else decision.event_start - maximum_anticipation
-    earliest = max(earliest, minimum_start)
+    earliest = earliest_narration_start(decision, safety_margin, maximum_anticipation)
     if latest < earliest:
         return None, "no_post_event_fit"
     cue_start = min(max(preferred, earliest), latest)
@@ -2364,6 +2387,8 @@ def synthesize_decisions(
     transformers_model: str | None,
     device: str,
     ffprobe: str,
+    *,
+    rewrite_for_time: Callable[[int, str, float, float], str | None] | None = None,
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
@@ -2380,7 +2405,7 @@ def synthesize_decisions(
             continue
         text = decision.description
         occupied = occupied_by_gap.setdefault((decision.gap_start, decision.gap_end), [])
-        available = max(0.25, decision.gap_end - decision.gap_start - 0.15)
+        anchor_seconds = narration_seconds_after_anchor(decision)
         for attempt in range(4):
             audio_path = synthesize_text(
                 text,
@@ -2392,7 +2417,11 @@ def synthesize_decisions(
             )
             duration = probe_duration(audio_path, ffprobe)
             cue_start, placement_method = choose_event_aware_cue_start(decision, duration, occupied=occupied)
-            if duration <= available and cue_start is not None:
+            decision.tts_attempts.append({
+                "description": text, "duration_seconds": round(duration, 3),
+                "available_seconds": round(anchor_seconds, 3), "result": placement_method,
+            })
+            if cue_start is not None:
                 decision.description = text
                 decision.tts_path = str(audio_path)
                 decision.tts_duration = duration
@@ -2415,19 +2444,19 @@ def synthesize_decisions(
                 )
                 break
             words = text.split()
-            if decision.description_ready_at is not None or len(words) <= 2:
+            if decision.description_ready_at is not None:
+                if (attempt == 0 and rewrite_for_time is not None and duration > 0
+                        and placement_method in {"no_gap_fit", "no_post_event_fit"}):
+                    shorter = rewrite_for_time(index, text, anchor_seconds, duration)
+                    if shorter and len(shorter.split()) < len(words):
+                        text = shorter
+                        continue
                 break
-            event_available = available
-            if decision.event_start is not None:
-                event_available = max(
-                    0.25,
-                    decision.gap_end
-                    - 0.075
-                    - max(decision.gap_start + 0.075, decision.event_start - 0.35),
-                )
+            if len(words) <= 2:
+                break
             target = max(
                 2,
-                math.floor(len(words) * min(available, event_available) / max(duration, 0.01) * 0.88),
+                math.floor(len(words) * anchor_seconds / max(duration, 0.01) * 0.88),
             )
             text = limit_words(text, max(2, min(target, len(words) - 1)))
         if not decision.tts_path:
@@ -2588,6 +2617,7 @@ def evaluate(
     elapsed: float,
 ) -> dict[str, Any]:
     active = [item for item in decisions if item.decision == "AD" and item.tts_path]
+    tts_candidates = sum(bool(item.tts_attempts or item.tts_path) for item in decisions)
     overlap_seconds = sum(
         overlap(item.cue_start, item.cue_end, interval.start, interval.end)
         for item in active
@@ -2639,11 +2669,8 @@ def evaluate(
             round(sum(event_offsets) / len(event_offsets), 4) if event_offsets else None
         ),
         "speech_overlap_seconds": round(overlap_seconds, 4),
-        "tts_fit_rate": round(
-            sum(item.tts_duration <= item.gap_end - item.gap_start for item in active) / len(active), 4
-        )
-        if active
-        else None,
+        "tts_candidates": tts_candidates,
+        "tts_fit_rate": round(len(active) / tts_candidates, 4) if tts_candidates else None,
         "processing_seconds": round(elapsed, 3),
         "real_time_factor": round(elapsed / media.duration, 4),
     }
@@ -3000,9 +3027,12 @@ def main() -> None:
         "ad_preparation", compute_device="cpu",
         method="qwen3_llama_cpp" if generate_cue else "incomplete_description_validation",
     ) as stage:
+        def build_cue_input(context: dict) -> dict:
+            return build_qwen_cue_input(context, reasoning_tokens=args.ad_preparer_reasoning_tokens)
+
         prepared = prepare_ad_cues(
             decisions, shots, words, generate_cue, scenes=scenes,
-            build_input=lambda context: build_qwen_cue_input(context, reasoning_tokens=args.ad_preparer_reasoning_tokens),
+            build_input=build_cue_input, narration_seconds=narration_seconds_after_anchor,
         )
         write_json(work_dir / "ad-preparation.json", prepared)
         counts = {status: sum(row["status"] == status for row in prepared)
@@ -3010,6 +3040,13 @@ def main() -> None:
         counts["contextual_identifications"] = sum(bool(row["dialogue_reference"]) for row in prepared)
         stage.update(reasoning_tokens=args.ad_preparer_reasoning_tokens, **counts)
         LOGGER.info("ad_preparation model=%s results=%s", args.ad_preparer_model, counts)
+    prepared_by_index = {row["decision_index"]: row for row in prepared}
+
+    def rewrite_for_time(index: int, text: str, seconds: float, measured: float) -> str | None:
+        if generate_cue is None or index not in prepared_by_index:
+            return None
+        return retry_prepared_cue(prepared_by_index[index], text, seconds, measured, generate_cue, build_cue_input)
+
     tts_compute_device = (
         device
         if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
@@ -3028,6 +3065,7 @@ def main() -> None:
             args.tts_model,
             device,
             ffprobe,
+            rewrite_for_time=rewrite_for_time if generate_cue else None,
         )
         stage.update(
             method=tts_backend,
@@ -3036,6 +3074,10 @@ def main() -> None:
             event_aligned_cues=sum(
                 item.placement_method.startswith("event_") for item in decisions if item.tts_path
             ),
+            cue_rewrite_attempts=sum("timing_retry" in row for row in prepared),
+            cue_rewrite_elapsed_seconds=round(sum(
+                row.get("timing_retry", {}).get("elapsed_seconds", 0) for row in prepared
+            ), 6),
         )
 
     with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
@@ -3052,6 +3094,7 @@ def main() -> None:
         knowledge_store.close()
 
     with profiler.stage("artifact_write", method="json_and_webvtt", compute_device="cpu"):
+        write_json(work_dir / "ad-preparation.json", prepared)
         write_vtt(decisions, work_dir / "descriptions.vtt")
         write_json(work_dir / "media.json", asdict(media))
         write_json(

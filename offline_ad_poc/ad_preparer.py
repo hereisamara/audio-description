@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import time
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 UNFINISHED_ENDINGS = {"a", "an", "the", "to", "of", "in", "on", "at", "with", "and", "or"}
 DEMONSTRATIVE_REFERENCE = re.compile(
-    r"\b(?:here(?:'s| is| are)|this is|these are|an example of|look at) "
+    r"\b(?:(?:here(?:'s| is| are)|this is|these are)(?: an example of)?|an example of|look at) "
     r"(?:(?:a|an|the|some) )?"
 )
 HANDLING_WORDS = {"hand", "hands", "palm", "hold", "holds", "holding", "show", "shows", "showing",
@@ -26,6 +27,11 @@ CONTEXT_CUE_WORDS = HANDLING_WORDS | {
     "a", "an", "the", "some", "of", "in", "on", "at", "with", "is", "are", "person", "their", "someone",
 }
 GENERIC_SUBJECT = re.compile(r"^(?:(?:a|the) person|he|she|they|i|we) ")
+CUE_INFLECTIONS = {
+    "a": "the", "an": "the", "are": "is",
+    "holding": "hold", "holds": "hold",
+    "revealing": "reveal", "revealed": "reveal",
+}
 CUE_SCHEMA = {
     "type": "object",
     "properties": {"description": {"type": "string"}, "dialogue_reference": {"type": "string"}},
@@ -77,6 +83,38 @@ def contextual_identification(draft: str, cue: str, dialogue: str, reference: st
     return ""
 
 
+def supports_visual_rewrite(draft: str, cue: str) -> bool:
+    draft_words = text_words(draft)
+    cue_words = text_words(cue)
+    vocabulary = {CUE_INFLECTIONS.get(word, word) for word in draft_words}
+    if all(CUE_INFLECTIONS.get(word, word) in vocabulary for word in cue_words):
+        return True
+    # A visible hand holding an explicit object also supports a person holding that same object.
+    holding = re.fullmatch(r"(?:a|the) person (?:holds|is holding) (?:a|an|the) (.+)", " ".join(cue_words))
+    return bool(holding and re.search(
+        rf"\bhands? holding (?:a|an|the) {re.escape(holding[1])}\b", " ".join(draft_words),
+    ))
+
+
+def validate_prepared_reply(context: dict, suggestion: str, reference: str) -> tuple[str | None, str]:
+    if not suggestion:
+        return "ad_preparer_no_reply", ""
+    if suggestion.casefold() == "wait" and not reference:
+        return "ad_preparer_wait", ""
+    if "\n" in suggestion or incomplete_cue(suggestion):
+        return "incomplete_visual_description", ""
+    if len(suggestion.split()) > context["max_words"]:
+        return "ad_preparer_word_limit", ""
+    if context["incomplete"]:
+        valid = not reference and suggestion in context["allowed_completions"]
+        return (None if valid else "ad_preparer_ungrounded_rewrite"), ""
+    dialogue = " ".join(text_words(context["dialogue"])).replace("’", "'")
+    grounded = contextual_identification(context["draft"], suggestion, dialogue, reference)
+    if grounded or (not reference and supports_visual_rewrite(context["draft"], suggestion)):
+        return None, grounded
+    return "ad_preparer_ungrounded_rewrite", ""
+
+
 def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
     budget = context["max_words"]
     instruction = (
@@ -86,6 +124,13 @@ def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
         "Write a direct, present-tense line in third person. Keep the main action and drop secondary details. "
         f"The description may contain at most {budget} words. Return a JSON object.\n"
     )
+    if "available_seconds" in context:
+        instruction += (
+            f"The safe narration slot is {context['available_seconds']:.2f} seconds. "
+            "Keep just the main visible action when time is tight. If it cannot fit, put WAIT in description.\n"
+        )
+    if context.get("timing_retry"):
+        instruction += "The previous cue was too long when spoken. Make this rewrite shorter.\n"
     if context.get("previous_ad") or context.get("previous_dialogue") or context.get("scene_previous_ads"):
         instruction += (
             "Use previous_dialogue and earlier prepared AD to follow the scene and prefer a new visible detail. "
@@ -110,7 +155,8 @@ def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
         )
     else:
         instruction += (
-            "Use the draft's words and leave dialogue_reference empty. Check for repetition before shortening.\n"
+            "Use the draft's evidence and preserve who does the action. "
+            "You may change verb inflections. Leave dialogue_reference empty and check for repetition.\n"
             'Draft: A person sets a bowl on the table. Dialogue: She sets a bowl on the table. '
             'Output: {"description":"WAIT","dialogue_reference":""}\n'
             'Draft: A person lifts a blue bowl from the counter. Dialogue: none. Max words: 5. '
@@ -122,6 +168,44 @@ def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
         "system_prompt": instruction, "user_prompt": data, "response_schema": schema,
         "generation": {"context_tokens": 2048, "reasoning_tokens": reasoning_tokens, "final_tokens": 72},
     }
+
+
+def request_prepared_cue(context: dict, generate: Callable[[dict], str],
+                         build_input: Callable[[dict], dict] | None) -> dict:
+    llm_input = build_input(context) if build_input is not None else None
+    raw = suggestion = grounded = ""
+    error = None
+    try:
+        raw = generate(llm_input if llm_input is not None else context)
+        response = json.loads(raw)
+        if (not isinstance(response, dict) or set(response) != set(CUE_SCHEMA["required"])
+                or not all(isinstance(value, str) for value in response.values())):
+            raise ValueError("Invalid cue response")
+        suggestion = direct_ad_text(response["description"])
+        rejection, grounded = validate_prepared_reply(context, suggestion, response["dialogue_reference"].strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = type(exc).__name__
+        rejection = "ad_preparer_execution_failed"
+    except ValueError:
+        error = rejection = "invalid_cue_response"
+    return {"llm_input": llm_input, "raw_output": raw, "suggestion": suggestion,
+            "rewrite_rejection": rejection, "dialogue_reference": grounded, "error": error}
+
+
+def retry_prepared_cue(record: dict, text: str, seconds: float, measured: float,
+                       generate: Callable[[dict], str], build_input: Callable[[dict], dict]) -> str | None:
+    words = len(text.split())
+    budget = min(words - 1, math.floor(words * seconds / measured * 0.9))
+    if budget < 2:
+        return None
+    started = time.perf_counter()
+    context = {**record["context"], "max_words": budget, "available_seconds": round(seconds, 3),
+               "timing_retry": {"previous_cue": text, "measured_seconds": round(measured, 3)}}
+    reply = request_prepared_cue(context, generate, build_input)
+    record["timing_retry"] = {
+        "context": context, **reply, "elapsed_seconds": round(time.perf_counter() - started, 6),
+    }
+    return reply["suggestion"] if reply["rewrite_rejection"] is None else None
 
 
 def run_qwen_cue(executable: str, model: Path, llm_input: dict) -> str:
@@ -165,6 +249,7 @@ def prepare_ad_cues(
     *,
     build_input: Callable[[dict], dict] | None = None,
     scenes: Sequence[Scene] = (),
+    narration_seconds: Callable[[Decision], float] | None = None,
 ) -> list[dict]:
     """Use prior evidence from the anchor shot and leave cue timing to TTS."""
     proposals = {
@@ -192,6 +277,9 @@ def prepare_ad_cues(
         dialogue = []
         completions = []
         budget = min(18, decision.word_budget)
+        available = narration_seconds(decision) if generate is not None and narration_seconds is not None else None
+        if available is not None:
+            budget = min(budget, math.floor(available * 2.5))
         if generate is not None and len(fallback.split()) > budget:
             fallback = ""
         if shot is not None:
@@ -233,59 +321,37 @@ def prepare_ad_cues(
             ][:3],
             "allowed_completions": [item["cue"] for item in completions],
         }
+        if available is not None:
+            context["available_seconds"] = round(available, 3)
         started = time.perf_counter()
-        raw = ""
-        error = None
-        llm_input = None
-        suggestion = reference = ""
+        reply = {"llm_input": None, "raw_output": "", "suggestion": "", "rewrite_rejection": None,
+                 "dialogue_reference": "", "error": None}
         already_spoken = generate is not None and not incomplete and repeats_spoken_action(draft, dialogue_text)
-        if generate is not None and not already_spoken and (not incomplete or completions):
-            try:
-                llm_input = build_input(context) if build_input is not None else None
-                raw = generate(llm_input if llm_input is not None else context)
-                response = json.loads(raw)
-                if (not isinstance(response, dict) or set(response) != set(CUE_SCHEMA["required"])
-                        or not all(isinstance(value, str) for value in response.values())):
-                    raise ValueError("Invalid cue response")
-                suggestion = direct_ad_text(response["description"])
-                reference = response["dialogue_reference"].strip()
-            except (OSError, subprocess.SubprocessError) as exc:
-                error = type(exc).__name__
-            except ValueError:
-                error = "invalid_cue_response"
-        uses_draft_words = set(text_words(suggestion)) <= set(text_words(draft))
-        grounded_reference = ""
-        if not incomplete and (reference or not uses_draft_words):
-            grounded_reference = contextual_identification(draft, suggestion, normalized_dialogue, reference)
-        wants_wait = suggestion.casefold() == "wait" and not reference
-        valid = (
-            bool(suggestion) and suggestion.casefold() != "wait" and len(suggestion.split()) <= budget
-            and "\n" not in suggestion and not incomplete_cue(suggestion)
-            and (not reference and suggestion in context["allowed_completions"] if incomplete
-                 else bool(grounded_reference) or (not reference and uses_draft_words))
-        )
-        decision.description = "" if wants_wait or already_spoken else suggestion if valid else fallback
+        hold = None
+        if budget < 2:
+            hold = "no_safe_post_event_slot"
+        elif already_spoken:
+            hold = "already_communicated_by_dialogue"
+        elif incomplete and not completions:
+            hold = "incomplete_visual_description"
+        elif generate is not None:
+            reply = request_prepared_cue(context, generate, build_input)
+            if reply["rewrite_rejection"] == "ad_preparer_wait":
+                hold = "ad_preparer_wait"
+        valid = bool(reply["suggestion"]) and reply["rewrite_rejection"] is None
+        decision.description = "" if hold else reply["suggestion"] if valid else fallback
         status = "prepared" if valid else "fallback" if decision.description else "wait"
         if status == "wait":
             decision.decision = "WAIT"
-            if already_spoken:
-                decision.reason = "already_communicated_by_dialogue"
-            elif wants_wait:
-                decision.reason = "ad_preparer_wait"
-            else:
-                decision.reason = (
-                    "incomplete_visual_description" if incomplete
-                    else "no_complete_description_within_word_budget"
-                )
+            decision.reason = hold or reply["rewrite_rejection"] or "no_complete_description_within_word_budget"
         elif anchor is not None:
             history.append((anchor, scene.scene_id if scene is not None else None, decision.description))
         audit.append({
             "decision_index": index, "shot_id": shot.shot_id if shot else None, "anchor": anchor,
             "dialogue_start": dialogue[0].start if dialogue else None,
             "dialogue_end": dialogue[-1].end if dialogue else None,
-            "context": context, "llm_input": llm_input, "completion_evidence": completions, "raw_output": raw,
-            "dialogue_reference": grounded_reference if valid else "",
-            "description": decision.description, "status": status, "error": error,
+            "context": context, "completion_evidence": completions, **reply,
+            "description": decision.description, "status": status,
             "hold_reason": decision.reason if status == "wait" else None,
             "elapsed_seconds": round(time.perf_counter() - started, 6),
         })

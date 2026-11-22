@@ -37,6 +37,7 @@ from offline_ad_poc.pipeline import (
     make_decisions,
     merge_intervals,
     mix_described_video,
+    narration_seconds_after_anchor,
     normalize_event_payload,
     plan_qwen_calls,
     record_ad_outcomes,
@@ -49,7 +50,7 @@ from offline_ad_poc.pipeline import (
     validate_whisper_word_timestamps,
     validate_shot_timeline,
 )
-from offline_ad_poc.ad_preparer import build_qwen_cue_input, prepare_ad_cues, run_qwen_cue
+from offline_ad_poc.ad_preparer import build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from offline_ad_poc.smolvlm import caption_texts
 from offline_ad_poc.knowledge_db import EvidenceStore
 
@@ -312,9 +313,66 @@ class PipelineUnitTests(unittest.TestCase):
         [prepared] = prepare_ad_cues(
             [decision], [], [], lambda _: '{"description":"A frog sits.","dialogue_reference":""}',
         )
-        self.assertEqual(held["hold_reason"], "no_complete_description_within_word_budget")
+        self.assertEqual(held["hold_reason"], "invalid_cue_response")
         self.assertEqual(prepared["context"]["draft"], draft)
         self.assertEqual(decision.description, "A frog sits.")
+
+    def test_nested_same_shot_identification_and_anchor_budget(self) -> None:
+        draft = "The hand holding the egg mass is shown in more detail, revealing the texture and color of the eggs."
+        decision = Decision(16.51, 26.41, "AD", draft, "test", 1, 24, [],
+                            event_start=18.485, description_ready_at=22.4224)
+        [record] = prepare_ad_cues(
+            [decision], [Shot(1, 14.214, 56.09)], [Word(14.48, 16.06, "here's an example of an egg mass that")],
+            lambda _: '{"description":"A person shows an egg mass.","dialogue_reference":"egg mass"}',
+            narration_seconds=narration_seconds_after_anchor,
+        )
+        self.assertEqual(record["dialogue_reference"], "egg mass")
+        self.assertEqual(record["context"]["max_words"], 9)
+        self.assertEqual(record["context"]["available_seconds"], 3.913)
+        self.assertEqual(decision.description, "A person shows an egg mass.")
+
+    def test_preparer_distinguishes_grounding_word_limit_and_unusable_anchor(self) -> None:
+        draft = "The hand holding the egg mass is shown."
+        decision = Decision(1, 5, "AD", draft, "test", 1, 6, [], event_start=3, description_ready_at=3.2)
+        def reply(text):
+            return lambda _: json.dumps({"description": text, "dialogue_reference": ""})
+
+        [grounded] = prepare_ad_cues([replace(decision)], [], [], reply("A person holds an egg mass."))
+        [wrong] = prepare_ad_cues([replace(decision)], [], [], reply("A person holds a snake."))
+        [long] = prepare_ad_cues([replace(decision)], [], [], reply("A person holds an egg mass in water."))
+        [late] = prepare_ad_cues(
+            [replace(decision, description_ready_at=4.94)], [], [],
+            lambda _: self.fail("An unusable anchor made an LLM request"),
+            narration_seconds=narration_seconds_after_anchor,
+        )
+        self.assertEqual(grounded["status"], "prepared")
+        self.assertEqual(wrong["hold_reason"], "ad_preparer_ungrounded_rewrite")
+        self.assertEqual(long["hold_reason"], "ad_preparer_word_limit")
+        self.assertEqual(late["hold_reason"], "no_safe_post_event_slot")
+
+    def test_grounded_tts_failure_gets_one_validated_shorter_retry(self) -> None:
+        draft = "A small black frog sits."
+        decision = Decision(16, 26, "AD", draft, "test", 1, 18, [],
+                            event_start=20, description_ready_at=23)
+        generator = lambda _: '{"description":"A frog sits.","dialogue_reference":""}'
+        [record] = prepare_ad_cues(
+            [decision], [], [], lambda _: json.dumps({"description": draft, "dialogue_reference": ""}),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("offline_ad_poc.pipeline.resolve_tts_backend", return_value=("transformers", "model")),
+            patch("offline_ad_poc.pipeline.synthesize_text", return_value=Path("narration.wav")),
+            patch("offline_ad_poc.pipeline.probe_duration", side_effect=[3.5, 1.4]),
+        ):
+            synthesize_decisions(
+                [decision], Path(directory), "transformers", None, "model", "cpu", "ffprobe",
+                rewrite_for_time=lambda _, text, room, duration: retry_prepared_cue(
+                    record, text, room, duration, generator, build_qwen_cue_input,
+                ),
+            )
+        self.assertEqual([a["result"] for a in decision.tts_attempts], ["no_post_event_fit", "event_aligned"])
+        self.assertEqual(record["timing_retry"]["context"]["max_words"], 3)
+        self.assertAlmostEqual(decision.cue_end, 24.55)
 
     def test_ad_preparer_keeps_earlier_cues_and_dialogue_scoped_to_the_anchor(self) -> None:
         decisions = [
