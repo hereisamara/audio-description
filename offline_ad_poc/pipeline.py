@@ -366,6 +366,9 @@ class Decision:
     selected_window: int | None = None
     gap_index: int | None = None
     visual_followups: list[dict[str, Any]] = field(default_factory=list)
+    fallback_scene_id: int | None = None
+    overlaps_dialogue: bool = False
+    dialogue_overlap_seconds: float = 0.0
 
 
 def run_command(args: Sequence[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -1627,6 +1630,8 @@ class Qwen25Backend(VisualBackend):
             "Supply one or two concise, factual sentences as visual evidence for an audio-description editor. "
             if defer_word_budget else f"Keep description to {word_limit} words or fewer. "
         )
+        if context.get("scene_fallback"):
+            description_instruction += "Describe the main new visible detail of this scene in one concise line. "
         history_instruction = (
             f"Earlier proposed narration: {' | '.join(previous_ad[-3:]) or 'none'}."
             if not context.get("defer_word_budget") else ""
@@ -2020,11 +2025,13 @@ def make_decisions(
     multi_event: bool = False,
     followup_budget: int = 0,
     defer_word_budget: bool = False,
+    gap_index_offset: int = 0,
+    scene_fallback: bool = False,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
-    for index, gap in enumerate(gaps[:maximum_gaps], start=1):
-        windows = split_evidence_windows(gap) if backend.uses_event_windows else [gap]
+    for index, gap in enumerate(gaps[:maximum_gaps], start=gap_index_offset + 1):
+        windows = split_evidence_windows(gap) if backend.uses_event_windows and not scene_fallback else [gap]
         proposals: list[dict[str, Any]] = []
         frames: list[EvidenceFrame] = []
         gap_dir = frame_root / f"gap-{index:03d}"
@@ -2034,6 +2041,8 @@ def make_decisions(
             context = context_for_gap(window, shots, scenes, soft_candidate_timestamps)
             if defer_word_budget:
                 context["defer_word_budget"] = True
+            if scene_fallback:
+                context["scene_fallback"] = True
             if refine_description:
                 context["refine_description"] = refine_description
             evidence = sample_event_evidence_frames(
@@ -2066,7 +2075,7 @@ def make_decisions(
                 }
             proposals.append({
                 "window_index": window_index,
-                "scan": "timing_followup" if refine_description else "initial",
+                "scan": "scene_fallback" if scene_fallback else "timing_followup" if refine_description else "initial",
                 "start": window.start,
                 "end": window.end,
                 "frames": [{"id": i, **asdict(frame)} for i, frame in enumerate(evidence, start=1)],
@@ -2101,7 +2110,7 @@ def make_decisions(
                 index, decision.selected_window, decision.decision, decision.event_timing_source,
                 decision.description_ready_at, decision.reason,
             )
-            if knowledge_store is not None:
+            if knowledge_store is not None and not scene_fallback:
                 knowledge_store.record_decision(len(decisions), decision)
             if decision.decision == "AD":
                 previous_ad.append(decision.description)
@@ -2166,6 +2175,12 @@ def record_ad_outcomes(
                         cue_count += 1
                         outcome.update(status="ad_added", stage="placement", reason="cue_placed",
                                        cue_start=item.cue_start, cue_end=item.cue_end)
+                        if item.fallback_scene_id is not None:
+                            outcome.update(
+                                reason=item.placement_method, scene_id=item.fallback_scene_id,
+                                overlaps_dialogue=item.overlaps_dialogue,
+                                dialogue_overlap_seconds=item.dialogue_overlap_seconds,
+                            )
                     elif item.placement_method.startswith("rejected_"):
                         outcome.update(stage="tts_and_placement", reason=item.reason)
                     else:
@@ -2173,7 +2188,8 @@ def record_ad_outcomes(
                     if item.tts_attempts:
                         outcome["tts_attempts"] = item.tts_attempts
             window["outcome"] = outcome
-        gap.update(status="ad_added" if cue_count else "no_ad",
+        flagged = any(window["outcome"].get("overlaps_dialogue") for window in group["windows"])
+        gap.update(status="ad_added" if cue_count else "no_ad", overlaps_dialogue=flagged,
                    reason="cue_placed" if cue_count else "no_cue_from_windows",
                    cue_count=cue_count)
     return list(groups.values())
@@ -2318,6 +2334,27 @@ def probe_duration(path: Path, ffprobe: str) -> float:
 NARRATION_MARGIN = 0.075
 
 
+def uncovered_scenes(scenes: Sequence[Scene], decisions: Sequence[Decision]) -> list[Scene]:
+    """Cover a scene when it has a rendered cue grounded in that scene."""
+    anchors = []
+    for decision in decisions:
+        if decision.decision == "AD" and decision.tts_path:
+            anchor = decision.description_ready_at
+            if anchor is None:
+                anchor = decision.event_start if decision.event_start is not None else decision.cue_start
+            anchors.append(anchor)
+    return [scene for scene in scenes if not any(scene.start <= anchor < scene.end for anchor in anchors)]
+
+
+def scene_fallback_windows(scenes: Sequence[Scene]) -> list[Gap]:
+    """Sample the opening of each scene while reserving some room for speech at its end."""
+    return [
+        Gap(scene.start, min(scene.start + 12.0, scene.end - min(3.0, (scene.end - scene.start) / 3)),
+            min(12, max(2, math.floor((scene.end - scene.start) * 2.5))))
+        for scene in scenes
+    ]
+
+
 def earliest_narration_start(decision: Decision, safety_margin: float = NARRATION_MARGIN,
                              maximum_anticipation: float = 0.35) -> float:
     earliest = decision.gap_start + safety_margin
@@ -2379,6 +2416,46 @@ def choose_event_aware_cue_start(
     return cue_start, method
 
 
+def choose_scene_fallback_start(
+    decision: Decision, duration: float, speech: Sequence[Interval], occupied: Sequence[Interval],
+) -> tuple[float | None, str, float]:
+    earliest = earliest_narration_start(decision)
+    latest = decision.gap_end - NARRATION_MARGIN - duration
+    if latest < earliest:
+        return None, "no_post_event_fit", 0.0
+    preferred = decision.preferred_cue_start if decision.preferred_cue_start is not None else earliest
+    latest = min(latest, max(earliest, preferred + 3.0))
+    preferred = min(latest, max(earliest, preferred))
+    speech = [item for item in speech if item.end > earliest and item.start < latest + duration]
+    blockers = [
+        Interval(item.start - NARRATION_MARGIN, item.end + NARRATION_MARGIN)
+        for item in occupied
+        if item.end + NARRATION_MARGIN > earliest and item.start - NARRATION_MARGIN < latest + duration
+    ]
+    # The overlap score is piecewise linear. Its minimum is at a speech boundary
+    # entering or leaving either end of the cue, or an allowed range endpoint.
+    edges = {earliest, latest, preferred}
+    for item in speech:
+        edges.update((item.start, item.end, item.start - duration, item.end - duration))
+    for item in blockers:
+        edges.update((item.start - duration, item.end))
+    best: tuple[float, float, float] | None = None
+    for start in edges:
+        end = start + duration
+        if not earliest <= start <= latest or any(
+            overlap(start, end, item.start, item.end) > 1e-6 for item in blockers
+        ):
+            continue
+        seconds = sum(overlap(start, end, item.start, item.end) for item in speech)
+        score = (round(seconds, 6), abs(start - preferred), start)
+        if best is None or score < best:
+            best = score
+    if best is None:
+        return None, "cue_conflict", 0.0
+    seconds, _, start = best
+    return start, "scene_fallback_overlap" if seconds > 0 else "scene_fallback_safe", seconds
+
+
 def synthesize_decisions(
     decisions: list[Decision],
     output_dir: Path,
@@ -2389,17 +2466,22 @@ def synthesize_decisions(
     ffprobe: str,
     *,
     rewrite_for_time: Callable[[int, str, float, float], str | None] | None = None,
+    decision_index_offset: int = 0,
+    fallback_speech: Sequence[Interval] = (),
+    existing_cues: Sequence[Decision] = (),
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
     occupied_by_gap: dict[tuple[float, float], list[Interval]] = {}
     priority = sorted(
-        enumerate(decisions, start=1),
+        enumerate(decisions, start=decision_index_offset + 1),
         key=lambda item: (
             item[1].gap_start, -item[1].importance,
             item[1].preferred_cue_start if item[1].preferred_cue_start is not None else item[1].gap_start,
         ),
     )
+    globally_occupied = [Interval(item.cue_start, item.cue_end) for item in existing_cues
+                         if item.decision == "AD" and item.tts_path]
     for index, decision in priority:
         if decision.decision != "AD":
             continue
@@ -2416,7 +2498,13 @@ def synthesize_decisions(
                 device,
             )
             duration = probe_duration(audio_path, ffprobe)
-            cue_start, placement_method = choose_event_aware_cue_start(decision, duration, occupied=occupied)
+            dialogue_overlap = 0.0
+            if decision.fallback_scene_id is not None:
+                cue_start, placement_method, dialogue_overlap = choose_scene_fallback_start(
+                    decision, duration, fallback_speech, globally_occupied,
+                )
+            else:
+                cue_start, placement_method = choose_event_aware_cue_start(decision, duration, occupied=occupied)
             decision.tts_attempts.append({
                 "description": text, "duration_seconds": round(duration, 3),
                 "available_seconds": round(anchor_seconds, 3), "result": placement_method,
@@ -2428,7 +2516,10 @@ def synthesize_decisions(
                 decision.cue_start = cue_start
                 decision.cue_end = decision.cue_start + duration
                 decision.placement_method = placement_method
+                decision.overlaps_dialogue = dialogue_overlap > 0
+                decision.dialogue_overlap_seconds = dialogue_overlap
                 occupied.append(Interval(decision.cue_start, decision.cue_end))
+                globally_occupied.append(Interval(decision.cue_start, decision.cue_end))
                 LOGGER.info(
                     "ad_placement decision=%d gap=%.3f-%.3f event=%.3f-%.3f "
                     "cue=%.3f-%.3f method=%s tts_duration=%.3f",
@@ -2442,6 +2533,9 @@ def synthesize_decisions(
                     placement_method,
                     duration,
                 )
+                if decision.fallback_scene_id is not None:
+                    LOGGER.info("scene_fallback_ad scene=%d dialogue_overlap_seconds=%.3f",
+                                decision.fallback_scene_id, dialogue_overlap)
                 break
             words = text.split()
             if decision.description_ready_at is not None:
@@ -2466,6 +2560,8 @@ def synthesize_decisions(
                 "no_gap_fit": "TTS narration is too long for the usable gap",
                 "no_post_event_fit": "TTS could not fit a safe post-event slot",
             }.get(placement_method, "TTS could not fit a safe post-event slot")
+            if decision.fallback_scene_id is not None and placement_method == "no_post_event_fit":
+                decision.reason = "TTS could not finish inside the scene fallback window"
             decision.description = ""
             decision.placement_method = (
                 "rejected_cue_conflict" if placement_method == "cue_conflict" else "rejected_no_safe_event_slot"
@@ -2486,6 +2582,8 @@ def write_vtt(decisions: Sequence[Decision], output: Path) -> None:
     for decision in sorted(decisions, key=lambda item: item.cue_start):
         if decision.decision != "AD" or not decision.tts_path:
             continue
+        if decision.overlaps_dialogue:
+            lines.extend([f"NOTE Dialogue overlap: {decision.dialogue_overlap_seconds:.3f} s", ""])
         lines.extend(
             [
                 f"{vtt_timestamp(decision.cue_start)} --> {vtt_timestamp(decision.cue_end)}",
@@ -2639,7 +2737,7 @@ def evaluate(
         "shots": len(shots),
         "scenes": len(scenes),
         "candidate_gaps": len(gaps),
-        "processed_gaps": sum(bool(item.visual_proposals) for item in decisions),
+        "processed_gaps": sum(bool(item.visual_proposals) and item.fallback_scene_id is None for item in decisions),
         "accepted_ad_events": len(active),
         "gaps_with_multiple_ad_events": sum(count > 1 for count in cue_counts.values()),
         "wait_events": sum(item.decision == "WAIT" for item in decisions),
@@ -2669,6 +2767,9 @@ def evaluate(
             round(sum(event_offsets) / len(event_offsets), 4) if event_offsets else None
         ),
         "speech_overlap_seconds": round(overlap_seconds, 4),
+        "scene_fallback_windows": sum(window["scan"] == "scene_fallback" for window in windows),
+        "scene_fallback_cues": sum(item.fallback_scene_id is not None for item in active),
+        "scene_fallback_overlap_cues": sum(item.overlaps_dialogue for item in active),
         "tts_candidates": tts_candidates,
         "tts_fit_rate": round(len(active) / tts_candidates, 4) if tts_candidates else None,
         "processing_seconds": round(elapsed, 3),
@@ -2711,6 +2812,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
+    parser.add_argument("--scene-fallback", action=argparse.BooleanOptionalAction, default=True,
+                        help="Describe uncovered scenes and flag any dialogue overlap")
     parser.add_argument("--ad-plan", choices=["single", "multi"], default="multi",
                         help="Choose one proposal or schedule multiple events per speech gap")
     parser.add_argument("--event-followups", type=int, default=2,
@@ -3080,6 +3183,49 @@ def main() -> None:
             ), 6),
         )
 
+    missing_scenes = uncovered_scenes(scenes, decisions) if args.scene_fallback else []
+    if qwen_plan is not None:
+        qwen_plan["max_scene_fallback_calls"] = 2 * len(missing_scenes)
+    if missing_scenes:
+        fallback_windows = scene_fallback_windows(missing_scenes)
+        with profiler.stage(
+            "scene_fallback_visual", method=args.visual_backend, compute_device=visual_compute_device,
+        ) as stage:
+            fallback = make_decisions(
+                input_video, fallback_windows, shots, scenes, segments, backend,
+                work_dir / "evidence-frames", len(fallback_windows),
+                args.evidence_max_edge or None, args.evidence_frames, soft_candidate_timestamps, knowledge_store,
+                defer_word_budget=defer_word_budget, gap_index_offset=len(gaps), scene_fallback=True,
+            )
+            stage["uncovered_scenes"] = len(missing_scenes)
+        for scene, window, item in zip(missing_scenes, fallback_windows, fallback, strict=True):
+            item.fallback_scene_id = scene.scene_id
+            item.gap_end = min(scene.end, window.end + 4.0)
+            gap_audit.append({
+                "kind": "scene_fallback", "scene_id": scene.scene_id, "gap_index": item.gap_index,
+                "start": item.gap_start, "end": item.gap_end, "status": "eligible",
+            })
+        offset = len(decisions)
+        with profiler.stage("scene_fallback_preparation", method="ad_preparation", compute_device="cpu"):
+            extra_prepared = prepare_ad_cues(
+                fallback, shots, words, generate_cue, scenes=scenes, build_input=build_cue_input,
+                narration_seconds=narration_seconds_after_anchor, decision_index_offset=offset,
+            )
+            prepared.extend(extra_prepared)
+            prepared_by_index.update((row["decision_index"], row) for row in extra_prepared)
+        with profiler.stage("scene_fallback_tts", method=tts_backend, compute_device=tts_compute_device) as stage:
+            synthesize_decisions(
+                fallback, work_dir / "narration", args.tts_backend, args.piper_model, args.tts_model, device, ffprobe,
+                rewrite_for_time=rewrite_for_time if generate_cue else None, decision_index_offset=offset,
+                fallback_speech=speech, existing_cues=decisions,
+            )
+            stage.update(
+                generated_cues=sum(bool(item.tts_path) for item in fallback),
+                dialogue_overlap_cues=sum(item.overlaps_dialogue for item in fallback),
+                compute_device=device if tts_backend == "transformers" else "cpu",
+            )
+        decisions.extend(fallback)
+
     with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
         proposals = record_ad_outcomes(gap_audit, decisions, multi_event=args.ad_plan == "multi")
         write_json(work_dir / "ad-proposals.json", proposals)
@@ -3139,6 +3285,7 @@ def main() -> None:
             "visual_backend": args.visual_backend,
             "qwen_call_plan": qwen_plan,
             "tts_backend": tts_backend,
+            "scene_fallback": args.scene_fallback,
             "offline": not args.allow_model_download,
             "runtime_log": str(work_dir / "runtime.log"),
             "runtime_events": str(profiler.events_path),

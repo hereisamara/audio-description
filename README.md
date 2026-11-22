@@ -198,6 +198,11 @@ extract it, and select the extracted run folder under **Import run** in
 Studio. Qwen2.5-VL runs on the GPU. The optional Qwen3 preparer runs on
 the CPU and saves its inputs and outputs in `work/ad-preparation.json`.
 
+After placing gap-based cues, the pipeline reviews scenes that still
+have no AD. It prefers a nearby dialogue-free slot when possible and flags
+any measured dialogue overlap in the package and VTT notes. Set
+`SCENE_FALLBACK=0` on the Slurm launch to use gap-based AD only.
+
 ### Pipeline output paths
 
 By default, it expects this layout inside the repository:

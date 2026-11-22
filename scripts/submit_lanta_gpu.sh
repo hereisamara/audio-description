@@ -54,6 +54,9 @@ ad_plan=${AD_PLAN:-multi}
 event_followups=${EVENT_FOLLOWUPS:-2}
 ad_preparer=${AD_PREPARER:-0}
 set --
+if [[ ${SCENE_FALLBACK:-1} == 0 ]]; then
+  set -- --no-scene-fallback
+fi
 if [[ -n "${QWEN_SECONDS_PER_CALL:-}" ]]; then
   set -- "$@" --qwen-seconds-per-call "$QWEN_SECONDS_PER_CALL"
 fi

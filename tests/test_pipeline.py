@@ -28,6 +28,7 @@ from offline_ad_poc.pipeline import (
     analysis_audio_is_silent,
     build_gaps,
     choose_event_aware_cue_start,
+    choose_scene_fallback_start,
     create_shot_boundary_evidence,
     decision_from_proposal,
     evidence_candidate_timestamps,
@@ -45,10 +46,13 @@ from offline_ad_poc.pipeline import (
     resize_frame_max_edge,
     sample_event_evidence_frames,
     segment_scenes,
+    scene_fallback_windows,
     speech_intervals_from_words,
     synthesize_decisions,
+    uncovered_scenes,
     validate_whisper_word_timestamps,
     validate_shot_timeline,
+    write_vtt,
 )
 from offline_ad_poc.ad_preparer import build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from offline_ad_poc.smolvlm import caption_texts
@@ -373,6 +377,58 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertEqual([a["result"] for a in decision.tts_attempts], ["no_post_event_fit", "event_aligned"])
         self.assertEqual(record["timing_retry"]["context"]["max_words"], 3)
         self.assertAlmostEqual(decision.cue_end, 24.55)
+
+    def test_scene_fallback_prefers_silence_and_avoids_existing_ad(self) -> None:
+        decision = Decision(0, 8, "AD", "A frog sits.", "test", 1, 5, [],
+                            event_start=1, description_ready_at=1, preferred_cue_start=1.15,
+                            fallback_scene_id=1)
+        cue, method, seconds = choose_scene_fallback_start(decision, 1, [Interval(0, 2.5)], [])
+        self.assertEqual((cue, method, seconds), (2.5, "scene_fallback_safe", 0.0))
+        cue, method, seconds = choose_scene_fallback_start(
+            decision, 1, [Interval(0, 8)], [Interval(0, 2.5)],
+        )
+        self.assertAlmostEqual(cue, 2.575)
+        self.assertEqual((method, seconds), ("scene_fallback_overlap", 1.0))
+        self.assertEqual(
+            choose_scene_fallback_start(decision, 1, [Interval(0, 8)], [Interval(0, 8)]),
+            (None, "cue_conflict", 0.0),
+        )
+
+    def test_scene_fallback_audits_an_overlapping_cue_for_an_uncovered_scene(self) -> None:
+        scenes = [Scene(1, 0, 5, [1], 0), Scene(2, 5, 10, [2], 1)]
+        placed = Decision(0, 5, "AD", "A bird flies.", "test", 1, 5, [],
+                          description_ready_at=2, cue_start=2, cue_end=3, tts_path="first.wav")
+        [scene] = uncovered_scenes(scenes, [placed])
+        [window] = scene_fallback_windows([scene])
+        self.assertEqual(scene.scene_id, 2)
+        self.assertEqual(window.start, 5)
+        decision = Decision(5, 10, "AD", "A frog sits.", "test", 1, 5, [],
+                            event_start=6, description_ready_at=6, fallback_scene_id=2,
+                            gap_index=3, selected_window=1, visual_proposals=[
+                                {"window_index": 1, "scan": "scene_fallback", "decision": "AD"}
+                            ])
+        audit = [{"kind": "scene_fallback", "gap_index": 3, "scene_id": 2}]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("offline_ad_poc.pipeline.resolve_tts_backend", return_value=("transformers", "model")),
+            patch("offline_ad_poc.pipeline.synthesize_text", return_value=Path("fallback.wav")) as synthesize,
+            patch("offline_ad_poc.pipeline.probe_duration", return_value=1.25),
+        ):
+            synthesize_decisions(
+                [decision], Path(directory), "transformers", None, "model", "cpu", "ffprobe",
+                decision_index_offset=1, fallback_speech=[Interval(5, 10)], existing_cues=[placed],
+            )
+            self.assertEqual(synthesize.call_args.args[1].name, "ad-002-try-1")
+            [group] = record_ad_outcomes(audit, [placed, decision], multi_event=True)
+            result = group["windows"][0]["outcome"]
+            self.assertEqual(result["decision_index"], 2)
+            self.assertEqual(result["scene_id"], 2)
+            self.assertEqual(result["reason"], "scene_fallback_overlap")
+            self.assertTrue(audit[0]["overlaps_dialogue"])
+            vtt = Path(directory) / "descriptions.vtt"
+            write_vtt([placed, decision], vtt)
+            self.assertIn("NOTE Dialogue overlap: 1.250 s", vtt.read_text())
+        self.assertEqual(uncovered_scenes(scenes, [placed, decision]), [])
 
     def test_ad_preparer_keeps_earlier_cues_and_dialogue_scoped_to_the_anchor(self) -> None:
         decisions = [

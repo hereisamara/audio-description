@@ -250,6 +250,7 @@ def prepare_ad_cues(
     build_input: Callable[[dict], dict] | None = None,
     scenes: Sequence[Scene] = (),
     narration_seconds: Callable[[Decision], float] | None = None,
+    decision_index_offset: int = 0,
 ) -> list[dict]:
     """Use prior evidence from the anchor shot and leave cue timing to TTS."""
     proposals = {
@@ -258,7 +259,7 @@ def prepare_ad_cues(
     }
     audit = []
     history: list[tuple[float, int | None, str]] = []
-    for index, decision in enumerate(decisions, 1):
+    for index, decision in enumerate(decisions, decision_index_offset + 1):
         if decision.decision != "AD":
             continue
         proposal = proposals.get((decision.gap_index, decision.selected_window), {})
