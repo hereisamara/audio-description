@@ -13,31 +13,49 @@
 
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
+usage() {
   echo "Usage: sbatch $0 INPUT_VIDEO [OUTPUT_VIDEO] [WORK_DIR]" >&2
+  echo "       sbatch $0 --studio-package INPUT_FOLDER" >&2
   exit 2
+}
+
+submit_dir=${SLURM_SUBMIT_DIR:-$PWD}
+repo_dir=${REPO_DIR:-$submit_dir}
+model_root="$repo_dir/models"
+conda_env=${CONDA_ENV:-offline-ad-gpu}
+package_dir=
+if [[ ${1:-} == --studio-package ]]; then
+  [[ $# -eq 2 ]] || usage
+  input_dir=$(cd -- "$2" && pwd -P)
+  input_video="$input_dir/original.mp4"
+  if [[ -z ${REPO_DIR:-} && -f "$input_dir/code/offline_ad_poc/pipeline.py" ]]; then
+    repo_dir="$input_dir/code"
+  fi
+  package_name="$(basename "$input_dir")-qwen-gpu-${SLURM_JOB_ID:?Submit this script with sbatch}"
+  package_dir="$submit_dir/outputs/studio-runs/$package_name"
+  output_video="$package_dir/video-ad.mp4"
+  work_dir="$package_dir/work"
+else
+  [[ $# -ge 1 && $# -le 3 ]] || usage
+  input_video=$1
+  input_name=$(basename "$input_video")
+  input_stem=${input_name%.*}
+  output_video=${2:-"$repo_dir/outputs/${input_stem}-ad.mp4"}
+  work_dir=${3:-"$repo_dir/outputs/${input_stem}-work"}
 fi
 
-module load Mamba/23.11.0-0
-
-repo_dir=${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
-conda_env=${CONDA_ENV:-offline-ad-gpu}
-input_video=$1
-input_name=$(basename "$input_video")
-input_stem=${input_name%.*}
-output_video=${2:-"$repo_dir/outputs/${input_stem}-ad.mp4"}
-work_dir=${3:-"$repo_dir/outputs/${input_stem}-work"}
-
-asr_model=${ASR_MODEL:-"$repo_dir/models/whisper-small.en-transformers"}
-vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
-tts_model=${TTS_MODEL:-"$repo_dir/models/mms-tts-eng"}
+asr_model=${ASR_MODEL:-"$model_root/whisper-small.en-transformers"}
+vlm_model=${VLM_MODEL:-"$model_root/Qwen2.5-VL-3B-Instruct"}
+tts_model=${TTS_MODEL:-"$model_root/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
 evidence_frames=${EVIDENCE_FRAMES:-6}
+evidence_max_edge=${EVIDENCE_MAX_EDGE:-0}
 ad_plan=${AD_PLAN:-multi}
 event_followups=${EVENT_FOLLOWUPS:-2}
-timing_args=()
+ad_preparer=${AD_PREPARER:-0}
+set --
 if [[ -n "${QWEN_SECONDS_PER_CALL:-}" ]]; then
-  timing_args=(--qwen-seconds-per-call "$QWEN_SECONDS_PER_CALL")
+  set -- "$@" --qwen-seconds-per-call "$QWEN_SECONDS_PER_CALL"
 fi
 
 for required_path in "$input_video" "$asr_model" "$vlm_model" "$tts_model"; do
@@ -47,7 +65,37 @@ for required_path in "$input_video" "$asr_model" "$vlm_model" "$tts_model"; do
   fi
 done
 
+module load Mamba/23.11.0-0
+case $ad_preparer in
+  0) ;;
+  1)
+    preparer_model=${AD_PREPARER_MODEL:-"$model_root/Qwen3-1.7B-Q4_K_M.gguf"}
+    preparer_executable=${AD_PREPARER_EXECUTABLE:-"$submit_dir/outputs/lanta-ad-preparer/bin/llama-completion"}
+    if [[ ! -s $preparer_model || ! -x $preparer_executable ]]; then
+      printf 'Missing AD preparer checkpoint or executable:\n  %s\n  %s\n' "$preparer_model" "$preparer_executable" >&2
+      exit 1
+    fi
+    conda run --no-capture-output -n "$conda_env" "$preparer_executable" --version
+    set -- "$@" --ad-preparer-model "$preparer_model" \
+      --ad-preparer-executable "$preparer_executable" \
+      --ad-preparer-reasoning-tokens "${AD_PREPARER_REASONING_TOKENS:-0}"
+    ;;
+  *)
+    echo "AD_PREPARER must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 cd "$repo_dir"
+if [[ -n $package_dir ]]; then
+  mkdir -p "$(dirname "$package_dir")"
+  mkdir "$package_dir"
+  ln -L "$input_video" "$package_dir/original.mp4" || cp "$input_video" "$package_dir/original.mp4"
+  for name in source.json dialogue.vtt dialogue.srt reference-ad.vtt; do
+    if [[ -f "$input_dir/$name" ]]; then
+      cp "$input_dir/$name" "$package_dir/$name"
+    fi
+  done
+fi
 mkdir -p "$(dirname "$output_video")" "$work_dir"
 
 export HF_HUB_OFFLINE=1
@@ -60,6 +108,8 @@ echo "Repository: $repo_dir"
 echo "Conda environment: $conda_env"
 echo "Input: $input_video"
 echo "Output: $output_video"
+echo "Visual evidence: $evidence_frames frames per window, max edge $evidence_max_edge (0 = source)"
+echo "AD preparer: $ad_preparer (1 = Qwen3 on CPU)"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not-set}"
 nvidia-smi
 
@@ -79,9 +129,16 @@ conda run --no-capture-output -n "$conda_env" \
   --tts-backend transformers \
   --tts-model "$tts_model" \
   --evidence-frames "$evidence_frames" \
+  --evidence-max-edge "$evidence_max_edge" \
   --ad-plan "$ad_plan" \
   --event-followups "$event_followups" \
   --maximum-gaps "$maximum_gaps" \
-  "${timing_args[@]}"
+  "$@"
 
 echo "Finished: $output_video"
+if [[ -n $package_dir ]]; then
+  archive="$package_dir.tar"
+  tar -cf "$archive.partial" -C "$(dirname "$package_dir")" "$package_name"
+  mv "$archive.partial" "$archive"
+  echo "Studio package: $archive"
+fi

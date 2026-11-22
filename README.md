@@ -169,6 +169,37 @@ The supplied Slurm script uses the `gpu` partition, project `lt200246`, one
 GPU, one Python task, and 16 CPU cores. It loads `Mamba/23.11.0-0` and runs the
 `offline-ad-gpu` Conda environment.
 
+### Studio package with the Qwen3 AD preparer
+
+Use Git to update the Lanta code checkout. Transfer the input videos,
+model checkpoints, and completed packages separately. Keep each clip in
+`inputs/<clip>/original.mp4` with its original soundtrack. Optional
+`source.json`, `dialogue.vtt` or `dialogue.srt`, and `reference-ad.vtt`
+files in that input folder are included in the Studio package.
+
+For the Qwen3 editor, place `Qwen3-1.7B-Q4_K_M.gguf` in `models/` and
+install the Linux CPU runtime once from the repository root.
+
+```bash
+module load Mamba/23.11.0-0
+conda create -y -p "$PWD/outputs/lanta-ad-preparer" --override-channels -c conda-forge 'llama.cpp=12418=cpu_mkl*'
+```
+
+Submit from the updated Git checkout. Setting `REPO_DIR` explicitly
+uses the checked-out code for inputs that contain an older snapshot.
+
+```bash
+REPO_DIR="$PWD" AD_PREPARER=1 EVIDENCE_FRAMES=3 EVIDENCE_MAX_EDGE=640 \
+  sbatch --time=00:30:00 scripts/submit_lanta_gpu.sh --studio-package "$PWD/inputs/oregon-spotted-frog"
+```
+
+Download the completed `outputs/studio-runs/<clip>-qwen-gpu-<job-id>.tar`,
+extract it, and select the extracted run folder under **Import run** in
+Studio. Qwen2.5-VL runs on the GPU. The optional Qwen3 preparer runs on
+the CPU and saves its inputs and outputs in `work/ad-preparation.json`.
+
+### Pipeline output paths
+
 By default, it expects this layout inside the repository:
 
 ```text
