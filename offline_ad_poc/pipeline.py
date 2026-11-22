@@ -32,8 +32,10 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 import cv2
 import numpy as np
 
+from .ad_preparer import build_qwen_cue_input, prepare_ad_cues, run_qwen_cue
 from .knowledge_db import EvidenceStore
-from .visual_events import apply_ad_policy, validate_visual_event
+from .smolvlm import DEFAULT_MAX_NEW_TOKENS
+from .visual_events import apply_ad_policy, direct_ad_text, validate_visual_event
 
 
 LOGGER = logging.getLogger("offline_ad_poc")
@@ -335,6 +337,7 @@ class EvidenceFrame:
     scene_id: int | None
     salience: float = 0.0
     role: str = "gap"
+    near_blank: bool = False
 
 
 @dataclass
@@ -441,6 +444,17 @@ def extract_analysis_audio(input_video: Path, output_wav: Path, ffmpeg: str) -> 
             str(output_wav),
         ]
     )
+
+
+def analysis_audio_is_silent(wav_path: Path) -> bool:
+    """Check the extracted 16-bit PCM for digital silence in bounded reads."""
+    with wave.open(str(wav_path), "rb") as source:
+        if source.getsampwidth() != 2:
+            return False
+        while frames := source.readframes(65536):
+            if np.frombuffer(frames, dtype="<i2").any():
+                return False
+    return True
 
 
 def choose_device(requested: str) -> str:
@@ -720,23 +734,38 @@ def build_gaps(
     minimum_duration: float = 1.5,
     safety_margin: float = 0.20,
     words_per_second: float = 2.5,
+    *,
+    audit: list[dict[str, Any]] | None = None,
 ) -> list[Gap]:
     gaps: list[Gap] = []
+
+    def scan(start: float, end: float) -> None:
+        span = end - start
+        if span <= 0:
+            return
+        usable_start = start + safety_margin
+        usable_end = end - safety_margin
+        usable_seconds = max(0.0, usable_end - usable_start)
+        gap_index = None
+        reason = "gap_too_short" if span < minimum_duration else "gap_too_short_after_padding"
+        if span >= minimum_duration and usable_seconds >= minimum_duration:
+            budget = max(1, math.floor(usable_seconds * words_per_second))
+            gaps.append(Gap(usable_start, usable_end, budget))
+            gap_index = len(gaps)
+            reason = "eligible_gap"
+        if audit is not None:
+            audit.append({
+                "start": start, "end": end, "gap_index": gap_index,
+                "usable_seconds": usable_seconds, "minimum_seconds": minimum_duration,
+                "status": "eligible" if gap_index is not None else "not_scanned",
+                "reason": reason,
+            })
+
     cursor = 0.0
     for interval in speech:
-        if interval.start - cursor >= minimum_duration:
-            usable_start = cursor + safety_margin
-            usable_end = interval.start - safety_margin
-            if usable_end - usable_start >= minimum_duration:
-                budget = max(1, math.floor((usable_end - usable_start) * words_per_second))
-                gaps.append(Gap(usable_start, usable_end, budget))
+        scan(cursor, interval.start)
         cursor = max(cursor, interval.end)
-    if duration - cursor >= minimum_duration:
-        usable_start = cursor + safety_margin
-        usable_end = max(usable_start, duration - safety_margin)
-        if usable_end - usable_start >= minimum_duration:
-            budget = max(1, math.floor((usable_end - usable_start) * words_per_second))
-            gaps.append(Gap(usable_start, usable_end, budget))
+    scan(cursor, duration)
     return gaps
 
 
@@ -896,6 +925,14 @@ def validate_shot_timeline(shots: Sequence[Shot], duration: float) -> dict[str, 
     }
 
 
+def is_near_blank(gray: np.ndarray) -> bool:
+    """Flag frames with very low brightness and almost no brighter detail."""
+    return bool(
+        gray.mean() < 12
+        and cv2.countNonZero(cv2.compare(gray, 24, cv2.CMP_GT)) <= 0.05 * gray.size
+    )
+
+
 def create_shot_boundary_evidence(
     video_path: Path,
     shots: Sequence[Shot],
@@ -976,12 +1013,29 @@ def create_shot_boundary_evidence(
     previous: np.ndarray | None = None
     frame_index = 0
     scored_candidates: list[tuple[float, float]] = []
+    near_blank_intervals: list[dict[str, float]] = []
+    dark_start: int | None = None
+    minimum_dark_frames = math.ceil(0.15 * fps)
+
+    def close_dark_interval(end: int) -> None:
+        if dark_start is not None and end - dark_start >= minimum_dark_frames:
+            near_blank_intervals.append({
+                "start": round(dark_start / fps, 6),
+                "end": round(min(duration, end / fps), 6),
+            })
+
     try:
         while True:
             ok, frame = soft_capture.read()
             if not ok:
                 break
             gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if is_near_blank(gray):
+                if dark_start is None:
+                    dark_start = frame_index
+            elif dark_start is not None:
+                close_dark_interval(frame_index)
+                dark_start = None
             if previous is not None:
                 score = float(np.mean(cv2.absdiff(previous, gray)))
                 timestamp = frame_index / fps
@@ -991,6 +1045,7 @@ def create_shot_boundary_evidence(
             frame_index += 1
     finally:
         soft_capture.release()
+    close_dark_interval(frame_index)
     detected_boundaries = [shot.start for shot in shots[1:]]
     selected_candidates: list[tuple[float, float]] = []
     for score, timestamp in sorted(scored_candidates, reverse=True):
@@ -1038,6 +1093,7 @@ def create_shot_boundary_evidence(
     report["validation_passed"] = report["valid_timeline"] and report["evidence_complete"]
     report["soft_candidates_requiring_review"] = soft_evidence
     report["soft_candidate_count"] = len(soft_evidence)
+    report["near_blank_intervals"] = near_blank_intervals
     LOGGER.info(
         "method stage=shot_boundary_validation backend=before_after_evidence "
         "boundaries=%d decoded=%d valid_timeline=%s evidence_complete=%s "
@@ -1338,6 +1394,7 @@ def sample_event_evidence_frames(
                     "timestamp": timestamp,
                     "salience": change + boundary_bonus,
                     "role": role,
+                    "near_blank": is_near_blank(gray),
                 }
             )
             previous_gray = gray
@@ -1404,6 +1461,7 @@ def sample_event_evidence_frames(
                 scene_id=scene_id,
                 salience=round(float(item["salience"]), 6),
                 role=str(item["role"]),
+                near_blank=bool(item["near_blank"]),
             )
         )
     return evidence
@@ -1556,9 +1614,18 @@ class Qwen25Backend(VisualBackend):
         previous_ad: Sequence[str],
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        if not any(gap.start <= frame.timestamp < gap.end for frame in frames):
+        evidence_ids = [index for index, frame in enumerate(frames, 1) if gap.start <= frame.timestamp < gap.end]
+        if not evidence_ids:
             return {"decision": "WAIT", "reason": "no_in_window_evidence", "attempts": []}
+        action_ready_ids = [index for index in evidence_ids if not frames[index - 1].near_blank]
+        expected_ids = ", ".join(map(str, evidence_ids))
+        action_ids = ", ".join(map(str, action_ready_ids)) or "none"
         word_limit = min(18, gap.word_budget)
+        defer_word_budget = context.get("defer_word_budget") and not context.get("refine_description")
+        description_instruction = (
+            "Supply one or two concise, factual sentences as visual evidence for an audio-description editor. "
+            if defer_word_budget else f"Keep description to {word_limit} words or fewer. "
+        )
         prompt = (
             "Identify the strongest new visible event or informative detail in the numbered film images. "
             "A cut alone is not an event. Describe only supported facts in the present tense. "
@@ -1569,26 +1636,22 @@ class Qwen25Backend(VisualBackend):
             '{"kind":"action","important":true,"already_audible":false,"uncertain":false,'
             '"frame_ids":[2,3],"ready_frame_id":3,"description":"A woman stands."} '
             "kind is one of none, action, setting, text, detail. "
-            "Use actual integer image IDs marked inside the window. "
+            f"Use only these integer image IDs as evidence: {expected_ids}. "
+            f"For an action ready_frame_id, use only these IDs: {action_ids}. "
+            "Near-blank images may show a transition but cannot anchor a visible action. "
             "ready_frame_id is the first supporting image where the complete description is apparent. "
             "For kind=none use important=false, frame_ids=[], ready_frame_id=null, description=\"\". "
-            f"Keep description to {word_limit} words or fewer. "
+            f"{description_instruction}"
             f"Recent dialogue: {transcript or 'none'}. "
             f"Earlier proposed narration: {' | '.join(previous_ad[-3:]) or 'none'}."
         )
         content: list[dict[str, Any]] = []
         for index, frame in enumerate(frames, start=1):
+            role = "context only"
+            if index in evidence_ids:
+                role = "inside window, near-blank" if frame.near_blank else "inside window"
             content.append({"type": "image", "image": str(Path(frame.path).resolve())})
-            content.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"Image ID {index} ("
-                        + ("inside window" if gap.start <= frame.timestamp < gap.end else "context only")
-                        + ")."
-                    ),
-                }
-            )
+            content.append({"type": "text", "text": f"Image ID {index} ({role})."})
         timestamps = [frame.timestamp for frame in frames]
         attempts: list[dict[str, Any]] = []
         instruction = prompt
@@ -1608,9 +1671,10 @@ class Qwen25Backend(VisualBackend):
                 return {"decision": "WAIT", "reason": "vlm_generation_failure", "attempts": attempts}
             try:
                 proposal = validate_visual_event(
-                    json_object_from_text(decoded), timestamps, gap.start, gap.end
+                    json_object_from_text(decoded), timestamps, gap.start, gap.end,
+                    action_ready_ids=action_ready_ids,
                 )
-                if len(proposal["description"].split()) > word_limit:
+                if not defer_word_budget and len(proposal["description"].split()) > word_limit:
                     raise ValueError(f"description exceeds the {word_limit}-word budget")
             except ValueError as exc:
                 attempts.append({"raw_output": decoded, "validation_error": str(exc)})
@@ -1745,7 +1809,16 @@ def limit_words(text: str, maximum: int) -> str:
     return shortened.rstrip(".!?") + "."
 
 
-def choose_backend(name: str, model_path: str | None, device: str) -> VisualBackend:
+def choose_backend(
+    name: str, model_path: str | None, device: str, *, smolvlm_max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+) -> VisualBackend:
+    if name == "smolvlm":
+        if not model_path:
+            raise ValueError("--vlm-model is required for --visual-backend smolvlm")
+        from .smolvlm import SmolVLMBackend
+
+        LOGGER.info("method stage=visual_backend backend=smolvlm device=%s", device)
+        return SmolVLMBackend(model_path, device, smolvlm_max_new_tokens)
     if name == "heuristic":
         LOGGER.info("method stage=visual_backend backend=heuristic device=cpu")
         return HeuristicBackend()
@@ -1940,6 +2013,7 @@ def make_decisions(
     knowledge_store: EvidenceStore | None = None,
     multi_event: bool = False,
     followup_budget: int = 0,
+    defer_word_budget: bool = False,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
@@ -1952,6 +2026,8 @@ def make_decisions(
         def inspect_window(window: Gap, refine_description: str = "") -> dict[str, Any]:
             window_index = len(proposals) + 1
             context = context_for_gap(window, shots, scenes, soft_candidate_timestamps)
+            if defer_word_budget:
+                context["defer_word_budget"] = True
             if refine_description:
                 context["refine_description"] = refine_description
             evidence = sample_event_evidence_frames(
@@ -2005,7 +2081,11 @@ def make_decisions(
         if not eligible:
             eligible = [proposals[0] if len(proposals) == 1 else {"decision": "WAIT", "reason": "no_eligible_event_in_gap"}]
         for position, payload in enumerate(eligible):
-            decision = decision_from_proposal(gap, payload, frames, index, backend.uses_event_windows)
+            decision = decision_from_proposal(
+                gap, payload, frames, index, backend.uses_event_windows, defer_word_budget=defer_word_budget,
+            )
+            if payload.get("decision") == "AD" and decision.decision == "WAIT":
+                payload["selection_reason"] = "no_usable_description"
             if position == 0:
                 decision.visual_proposals = proposals
                 decision.visual_followups = reviews
@@ -2022,13 +2102,85 @@ def make_decisions(
     return decisions
 
 
+def record_ad_outcomes(
+    gap_audit: list[dict[str, Any]], decisions: Sequence[Decision], *, multi_event: bool,
+) -> list[dict[str, Any]]:
+    """Link each inspected window to its final cue or the stage that stopped it."""
+    groups: dict[int, dict[str, Any]] = {}
+    selected = {}
+    for index, item in enumerate(decisions, start=1):
+        if item.gap_index is None:
+            continue
+        if item.visual_proposals:
+            groups[item.gap_index] = {
+                "gap_index": item.gap_index, "gap_start": item.gap_start, "gap_end": item.gap_end,
+                "selected_window": item.selected_window, "selected_windows": [],
+                "windows": item.visual_proposals, "followups": item.visual_followups,
+            }
+        if item.selected_window is not None:
+            selected[item.gap_index, item.selected_window] = (index, item)
+            groups[item.gap_index]["selected_windows"].append(item.selected_window)
+
+    for gap in gap_audit:
+        if gap["gap_index"] is None:
+            continue
+        group = groups.get(gap["gap_index"])
+        if group is None:
+            gap.update(status="not_scanned", reason="gap_scan_limit")
+            continue
+        discarded = {}
+        for review in group["followups"]:
+            if review["kind"] == "duplicate_text":
+                discarded[review["discarded_window"]] = "duplicate_visual_event"
+            elif review["kind"] == "compare_events" and review["relation"] == "same":
+                discarded[review["windows"][1]] = "duplicate_visual_event"
+            elif review["kind"] == "earlier_support":
+                if review["used"]:
+                    discarded[review["source_window"]] = "replaced_by_earlier_evidence"
+                else:
+                    discarded[review["review_window"]] = "timing_followup_not_selected"
+
+        cue_count = 0
+        for window in group["windows"]:
+            window_index = window["window_index"]
+            outcome = {"status": "no_ad", "stage": "visual_review", "reason": window.get("reason") or "no_vlm_output"}
+            if outcome["reason"] in {"invalid_vlm_output", "empty_or_incomplete_caption"}:
+                replies = [window.get("raw_caption"), *(attempt.get("raw_output") for attempt in window.get("attempts", []))]
+                if not any(isinstance(reply, str) and reply.strip() for reply in replies):
+                    outcome["reason"] = "empty_vlm_output"
+            if window.get("decision") == "AD":
+                result = selected.get((gap["gap_index"], window_index))
+                if result is None:
+                    reason = "window_not_selected" if multi_event else "single_event_plan"
+                    outcome.update(stage="event_selection", reason=window.get("selection_reason") or discarded.get(window_index, reason))
+                else:
+                    index, item = result
+                    outcome["decision_index"] = index
+                    if item.decision == "AD" and item.tts_path:
+                        cue_count += 1
+                        outcome.update(status="ad_added", stage="placement", reason="cue_placed",
+                                       cue_start=item.cue_start, cue_end=item.cue_end)
+                    elif item.placement_method.startswith("rejected_"):
+                        outcome.update(stage="tts_and_placement", reason=item.reason)
+                    else:
+                        outcome.update(stage="ad_preparation", reason=item.reason or "ad_preparer_wait")
+            window["outcome"] = outcome
+        gap.update(status="ad_added" if cue_count else "no_ad",
+                   reason="cue_placed" if cue_count else "no_cue_from_windows",
+                   cue_count=cue_count)
+    return list(groups.values())
+
+
 def decision_from_proposal(
-    gap: Gap, proposal: dict[str, Any], frames: Sequence[EvidenceFrame], gap_index: int, grounded: bool
+    gap: Gap, proposal: dict[str, Any], frames: Sequence[EvidenceFrame], gap_index: int, grounded: bool,
+    *, defer_word_budget: bool = False,
 ) -> Decision:
     payload = proposal if grounded else normalize_event_payload(proposal, frames, gap)
     description = ""
     if str(payload.get("decision", "WAIT")).upper() == "AD":
-        description = limit_words(str(payload.get("description", "")).strip(), gap.word_budget)
+        description = direct_ad_text(str(payload.get("description", "")))
+        if not defer_word_budget:
+            description = limit_words(description, gap.word_budget)
     is_ad = bool(description)
     ready_at = _coerce_timestamp(payload.get("description_ready_at")) if is_ad else None
     event_start = _coerce_timestamp(payload.get("event_start")) if is_ad else None
@@ -2280,10 +2432,11 @@ def synthesize_decisions(
             text = limit_words(text, max(2, min(target, len(words) - 1)))
         if not decision.tts_path:
             decision.decision = "WAIT"
-            decision.reason = (
-                "TTS conflicts with a higher-priority cue"
-                if placement_method == "cue_conflict" else "TTS could not fit a safe post-event slot"
-            )
+            decision.reason = {
+                "cue_conflict": "TTS conflicts with a higher-priority cue",
+                "no_gap_fit": "TTS narration is too long for the usable gap",
+                "no_post_event_fit": "TTS could not fit a safe post-event slot",
+            }.get(placement_method, "TTS could not fit a safe post-event slot")
             decision.description = ""
             decision.placement_method = (
                 "rejected_cue_conflict" if placement_method == "cue_conflict" else "rejected_no_safe_event_slot"
@@ -2514,8 +2667,14 @@ def parse_args() -> argparse.Namespace:
         help="Local Whisper model directory; model downloading is disabled by default",
     )
     parser.add_argument("--allow-model-download", action="store_true", help="Disabled by default for offline runs")
-    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25"], default="heuristic")
+    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25", "smolvlm"], default="heuristic")
+    parser.add_argument("--smolvlm-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
+                        help="Maximum generated tokens per SmolVLM frame")
     parser.add_argument("--vlm-model", help="Local Qwen2.5-VL model directory")
+    parser.add_argument("--ad-preparer-model", type=Path, help="Optional local Qwen3-1.7B GGUF for cue editing")
+    parser.add_argument("--ad-preparer-executable", default="llama-completion", help="Path to llama-completion")
+    parser.add_argument("--ad-preparer-reasoning-tokens", type=int, default=0,
+                        help="Optional CPU thinking pass before the final AD JSON (0 disables it)")
     parser.add_argument(
         "--tts-backend",
         choices=["auto", "transformers", "piper", "espeak-ng", "say"],
@@ -2560,6 +2719,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.smolvlm_max_new_tokens < 1:
+        raise ValueError("--smolvlm-max-new-tokens must be positive")
+    if not 0 <= args.ad_preparer_reasoning_tokens <= 512:
+        raise ValueError("--ad-preparer-reasoning-tokens must be between 0 and 512")
+    if args.ad_preparer_reasoning_tokens and not args.ad_preparer_model:
+        raise ValueError("--ad-preparer-reasoning-tokens requires --ad-preparer-model")
+    generate_cue = None
+    if args.ad_preparer_model:
+        model_path = args.ad_preparer_model.resolve()
+        executable = shutil.which(args.ad_preparer_executable)
+        if not model_path.is_file() or not executable:
+            raise ValueError("AD preparation requires a local GGUF file and an executable llama-completion")
+        generate_cue = lambda llm_input: run_qwen_cue(executable, model_path, llm_input)
     if args.evidence_max_edge < 0:
         raise ValueError("--evidence-max-edge must be zero or a positive integer")
     if args.evidence_frames < 3:
@@ -2618,17 +2790,37 @@ def main() -> None:
         compute_device="cpu",
     ):
         extract_analysis_audio(input_video, analysis_wav, ffmpeg)
-    with profiler.stage("asr", requested_method=args.asr_backend, compute_device=device) as stage:
-        raw_segments, raw_words, asr_report = transcribe_audio(
-            analysis_wav,
-            args.asr_model,
-            device,
-            args.allow_model_download,
-            args.asr_backend,
-        )
+    with profiler.stage("audio_silence_check", method="pcm_exact_zero", compute_device="cpu") as stage:
+        silent_audio = analysis_audio_is_silent(analysis_wav)
+        stage.update(silent=silent_audio)
+    with profiler.stage(
+        "asr", requested_method=args.asr_backend, compute_device="cpu" if silent_audio else device,
+    ) as stage:
+        if silent_audio:
+            raw_segments, raw_words = [], []
+            asr_report = {
+                "backend": "silence_skip",
+                "model": args.asr_model,
+                "device": "cpu",
+                "skipped": True,
+                "skip_reason": "silent_pcm",
+                "segments": 0,
+                "words": 0,
+            }
+            stage.update(skip_reason=asr_report["skip_reason"])
+            LOGGER.info("method stage=asr backend=silence_skip device=cpu reason=silent_pcm")
+        else:
+            raw_segments, raw_words, asr_report = transcribe_audio(
+                analysis_wav,
+                args.asr_model,
+                device,
+                args.allow_model_download,
+                args.asr_backend,
+            )
         stage.update(
             method=asr_report["backend"],
             model=asr_report["model"],
+            skipped=silent_audio,
             segments=len(raw_segments),
             words=len(raw_words),
         )
@@ -2663,7 +2855,8 @@ def main() -> None:
         compute_device="cpu",
     ) as stage:
         speech = speech_intervals_from_words(words, media.duration)
-        gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
+        gap_audit: list[dict[str, Any]] = []
+        gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap, audit=gap_audit)
         stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
 
     with profiler.stage("shot_detection", compute_device="cpu") as stage:
@@ -2692,6 +2885,7 @@ def main() -> None:
             validation_passed=shot_validation["validation_passed"],
             warnings=len(shot_validation["warnings"]),
             soft_candidates=shot_validation["soft_candidate_count"],
+            near_blank_intervals=len(shot_validation["near_blank_intervals"]),
         )
     with profiler.stage(
         "shot_visual_features",
@@ -2753,13 +2947,17 @@ def main() -> None:
             args.qwen_seconds_per_call,
         )
         LOGGER.info("qwen_call_plan %s", json.dumps(qwen_plan))
-    visual_compute_device = device if args.visual_backend == "qwen25" else "cpu"
+    visual_compute_device = device if args.visual_backend in {"qwen25", "smolvlm"} else "cpu"
+    followup_budget = args.event_followups if args.visual_backend == "qwen25" else 0
+    defer_word_budget = args.visual_backend == "qwen25" and generate_cue is not None
     with profiler.stage(
         "visual_backend_initialization",
         method=args.visual_backend,
         compute_device=visual_compute_device,
     ):
-        backend = choose_backend(args.visual_backend, args.vlm_model, device)
+        backend = choose_backend(
+            args.visual_backend, args.vlm_model, device, smolvlm_max_new_tokens=args.smolvlm_max_new_tokens,
+        )
     with profiler.stage(
         "ad_decisions",
         method=args.visual_backend,
@@ -2767,9 +2965,11 @@ def main() -> None:
         evidence_max_edge=args.evidence_max_edge or "source",
         evidence_frames_per_window=args.evidence_frames,
         ad_plan=args.ad_plan,
-        event_followup_budget=args.event_followups if args.ad_plan == "multi" and backend.uses_event_windows else 0,
+        event_followup_budget=followup_budget if args.ad_plan == "multi" else 0,
         evidence_sampling="temporal_windows" if backend.uses_event_windows else "adaptive_visual_change_and_boundaries",
     ) as stage:
+        if args.visual_backend == "qwen25":
+            stage["word_budget_stage"] = "ad_preparation" if defer_word_budget else "visual_review"
         decisions = make_decisions(
             input_video,
             gaps,
@@ -2784,7 +2984,8 @@ def main() -> None:
             soft_candidate_timestamps,
             knowledge_store,
             multi_event=args.ad_plan == "multi",
-            followup_budget=args.event_followups,
+            followup_budget=followup_budget,
+            defer_word_budget=defer_word_budget,
         )
         stage.update(
             processed_gaps=sum(bool(item.visual_proposals) for item in decisions),
@@ -2795,22 +2996,20 @@ def main() -> None:
             wait_decisions=sum(item.decision == "WAIT" for item in decisions),
             **backend.runtime_metrics(),
         )
-    with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
-        plan_by_gap: dict[int | None, dict[str, Any]] = {}
-        for item in decisions:
-            if item.visual_proposals:
-                plan_by_gap[item.gap_index] = {
-                    "gap_index": item.gap_index,
-                    "gap_start": item.gap_start,
-                    "gap_end": item.gap_end,
-                    "selected_window": item.selected_window,
-                    "selected_windows": [],
-                    "windows": item.visual_proposals,
-                    "followups": item.visual_followups,
-                }
-            if item.selected_window is not None:
-                plan_by_gap[item.gap_index]["selected_windows"].append(item.selected_window)
-        write_json(work_dir / "ad-proposals.json", list(plan_by_gap.values()))
+    with profiler.stage(
+        "ad_preparation", compute_device="cpu",
+        method="qwen3_llama_cpp" if generate_cue else "incomplete_description_validation",
+    ) as stage:
+        prepared = prepare_ad_cues(
+            decisions, shots, words, generate_cue, scenes=scenes,
+            build_input=lambda context: build_qwen_cue_input(context, reasoning_tokens=args.ad_preparer_reasoning_tokens),
+        )
+        write_json(work_dir / "ad-preparation.json", prepared)
+        counts = {status: sum(row["status"] == status for row in prepared)
+                  for status in ("prepared", "fallback", "wait")}
+        counts["contextual_identifications"] = sum(bool(row["dialogue_reference"]) for row in prepared)
+        stage.update(reasoning_tokens=args.ad_preparer_reasoning_tokens, **counts)
+        LOGGER.info("ad_preparation model=%s results=%s", args.ad_preparer_model, counts)
     tts_compute_device = (
         device
         if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
@@ -2838,6 +3037,10 @@ def main() -> None:
                 item.placement_method.startswith("event_") for item in decisions if item.tts_path
             ),
         )
+
+    with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
+        proposals = record_ad_outcomes(gap_audit, decisions, multi_event=args.ad_plan == "multi")
+        write_json(work_dir / "ad-proposals.json", proposals)
 
     with profiler.stage(
         "knowledge_finalize",
@@ -2870,7 +3073,7 @@ def main() -> None:
         write_json(work_dir / "dialogue-validation.json", dialogue_validation_report)
         write_json(
             work_dir / "speech-and-gaps.json",
-            {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]},
+            {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps], "gap_audit": gap_audit},
         )
         write_json(work_dir / "shots.json", [asdict(x) for x in shots])
         write_json(work_dir / "shot-boundary-validation.json", shot_validation)

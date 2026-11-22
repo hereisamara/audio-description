@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import wave
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,16 +25,21 @@ from offline_ad_poc.pipeline import (
     _detect_shots_opencv,
     _segments_from_words,
     _whisper_generate_kwargs,
+    analysis_audio_is_silent,
     build_gaps,
     choose_event_aware_cue_start,
+    create_shot_boundary_evidence,
+    decision_from_proposal,
     evidence_candidate_timestamps,
     expand_qwen_image_tokens,
+    is_near_blank,
     limit_words,
     make_decisions,
     merge_intervals,
     mix_described_video,
     normalize_event_payload,
     plan_qwen_calls,
+    record_ad_outcomes,
     refine_gap_events,
     resize_frame_max_edge,
     sample_event_evidence_frames,
@@ -43,6 +49,8 @@ from offline_ad_poc.pipeline import (
     validate_whisper_word_timestamps,
     validate_shot_timeline,
 )
+from offline_ad_poc.ad_preparer import build_qwen_cue_input, prepare_ad_cues, run_qwen_cue
+from offline_ad_poc.smolvlm import caption_texts
 from offline_ad_poc.knowledge_db import EvidenceStore
 
 
@@ -65,6 +73,66 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertLess(gaps[0].end, 6.0)
         self.assertGreater(gaps[0].word_budget, 0)
 
+    def test_gap_audit_distinguishes_short_breaks_from_the_scan_limit(self) -> None:
+        speech = [Interval(1.0, 3.0), Interval(4.75, 5.0), Interval(9.0, 10.0)]
+        audit = []
+        gaps = build_gaps(speech, duration=14.0, audit=audit)
+        decision = Decision(gaps[0].start, gaps[0].end, "WAIT", "", "no_visual_event", 0, 8, [],
+                            gap_index=1, visual_proposals=[{
+                                "window_index": 1, "decision": "WAIT", "reason": "no_visual_event"
+                            }])
+        [group] = record_ad_outcomes(audit, [decision], multi_event=False)
+
+        self.assertEqual(gaps, build_gaps(speech, duration=14.0))
+        self.assertEqual([row["reason"] for row in audit], [
+            "gap_too_short", "gap_too_short_after_padding", "no_cue_from_windows", "gap_scan_limit",
+        ])
+        self.assertAlmostEqual(audit[1]["usable_seconds"], 1.35)
+        self.assertEqual(group["windows"][0]["outcome"]["stage"], "visual_review")
+
+    def test_window_audit_preserves_raw_output_and_the_final_stop_reason(self) -> None:
+        audit = []
+        [gap] = build_gaps([], 20, audit=audit)
+        raw = "A person walks along a bank."
+        windows = [
+            {"window_index": 1, "decision": "WAIT", "reason": "empty_or_incomplete_caption", "raw_caption": ""},
+            {"window_index": 2, "decision": "AD", "raw_caption": raw},
+            {"window_index": 3, "decision": "AD", "raw_caption": raw},
+            {"window_index": 4, "decision": "AD", "raw_caption": raw},
+            {"window_index": 5, "decision": "AD", "raw_caption": raw},
+        ]
+        placed = Decision(gap.start, gap.end, "AD", raw, "caption", 1, 18, [], gap_index=1,
+                          selected_window=2, tts_path="cue.wav", cue_start=4, cue_end=6, visual_proposals=windows,
+                          visual_followups=[{"kind": "duplicate_text", "discarded_window": 3}])
+        held = replace(placed, selected_window=4, decision="WAIT", tts_path="",
+                       reason="already_communicated_by_dialogue", visual_proposals=[], visual_followups=[])
+        late = replace(held, selected_window=5, placement_method="rejected_no_safe_event_slot",
+                       reason="TTS could not fit a safe post-event slot")
+        [group] = record_ad_outcomes(audit, [placed, held, late], multi_event=True)
+
+        self.assertEqual(audit[0]["cue_count"], 1)
+        self.assertEqual(group["selected_windows"], [2, 4, 5])
+        self.assertEqual([row["outcome"]["reason"] for row in windows], [
+            "empty_vlm_output", "cue_placed", "duplicate_visual_event", "already_communicated_by_dialogue",
+            "TTS could not fit a safe post-event slot",
+        ])
+        self.assertEqual(windows[1]["outcome"]["cue_start"], 4)
+        self.assertEqual(windows[3]["outcome"]["stage"], "ad_preparation")
+        self.assertEqual(windows[4]["outcome"]["stage"], "tts_and_placement")
+        self.assertTrue(all(row["raw_caption"] == raw for row in windows[1:]))
+
+    def test_silence_check_reads_past_a_silent_opening(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "analysis.wav"
+            samples = np.zeros(70000, dtype="<i2")
+            for final_sample in (0, -1):
+                with self.subTest(final_sample=final_sample):
+                    samples[-1] = final_sample
+                    with wave.open(str(wav_path), "wb") as audio:
+                        audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                        audio.writeframes(samples.tobytes())
+                    self.assertEqual(analysis_audio_is_silent(wav_path), final_sample == 0)
+
     def test_invalid_whisper_word_durations_are_rejected(self) -> None:
         words = [
             Word(1.0, 1.4, "real"),
@@ -80,6 +148,209 @@ class PipelineUnitTests(unittest.TestCase):
     def test_limit_words_respects_budget(self) -> None:
         text = limit_words("one two three four five six", 4)
         self.assertEqual(len(text.split()), 4)
+
+    def test_ad_decision_uses_direct_visual_description(self) -> None:
+        for raw, expected in (
+            ("I see a glass with water on top of a table.", "A glass with water on top of a table."),
+            ("In the frame, you can see that steam rises from a pot.", "Steam rises from a pot."),
+            ("The image shows a person washing vegetables.", "A person washing vegetables."),
+            ('A sign reads "I see you."', 'A sign reads "I see you."'),
+            ("I see.", ""),
+        ):
+            with self.subTest(raw=raw):
+                decision = decision_from_proposal(
+                    Gap(0.0, 10.0, 10), {"decision": "AD", "description": raw}, [], 1, True,
+                )
+                self.assertEqual(decision.description, expected)
+                self.assertEqual(decision.decision, "AD" if expected else "WAIT")
+
+    def test_ad_preparer_needs_prior_visual_support_inside_the_same_shot(self) -> None:
+        draft = "A person is holding a."
+        full = "A person is holding a cup."
+        decision = Decision(7, 15, "AD", draft, "test", 1, 10, [], description_ready_at=8)
+        decision.visual_proposals = [
+            {"window_index": 1, "decision": "AD", "description": full, "description_ready_at": 4},
+            {"window_index": 2, "decision": "AD", "description": full, "description_ready_at": 11},
+        ]
+        shots = [Shot(1, 0, 5), Shot(2, 5, 15)]
+        words = [Word(4, 4.5, "wrong shot"), Word(6, 6.5, "cup"), Word(9, 9.5, "future")]
+
+        def unexpected(context):
+            self.fail("Called the LLM without corroborating visual evidence")
+
+        [held] = prepare_ad_cues([replace(decision)], shots, words, unexpected)
+        self.assertEqual(held["status"], "wait")
+        self.assertEqual(held["context"]["dialogue"], "cup")
+
+        decision.visual_proposals.append(
+            {"window_index": 3, "decision": "AD", "description": full, "description_ready_at": 7}
+        )
+        [prepared] = prepare_ad_cues([decision], shots, words, lambda context: json.dumps({
+            "description": full, "dialogue_reference": "",
+        }))
+        self.assertEqual(prepared["completion_evidence"], [{"timestamp": 7, "cue": full}])
+        self.assertEqual(decision.description, full)
+        self.assertEqual(decision.description_ready_at, 8)
+
+    def test_ad_preparer_corrects_the_object_when_same_shot_dialogue_identifies_it(self) -> None:
+        draft = "A person's hand is partially visible with dirt and debris on it."
+        revised = "A person shows an egg mass."
+        decision = Decision(7, 15, "AD", draft, "test", 1, 18, [], description_ready_at=8)
+        shots = [Shot(1, 0, 5), Shot(2, 5, 15)]
+        for start, dialogue, cue, reference, expected in (
+            (6, "An example of an egg mass that was recently laid.", revised, "egg mass", revised),
+            (6, "An example of an egg mass that was recently laid.", revised, "", revised),
+            (6, "It is the time of year when an egg mass can form.", revised, "egg mass", draft),
+            (4, "An example of an egg mass.", revised, "egg mass", draft),
+            (6, "An example of an egg mass.", "A person shows an egg mass in a jar.", "egg mass", draft),
+        ):
+            with self.subTest(start=start, dialogue=dialogue, cue=cue, reference=reference):
+                [result] = prepare_ad_cues(
+                    [replace(decision)], shots, [Word(start, start + 0.5, dialogue)],
+                    lambda context: json.dumps({"description": cue, "dialogue_reference": reference}),
+                )
+                self.assertEqual(result["description"], expected)
+                self.assertEqual(result["dialogue_reference"], "egg mass" if expected == revised else "")
+
+    def test_ad_preparer_honors_wait_and_keeps_fallback_for_invalid_output(self) -> None:
+        draft = "A person sets a bowl on the table."
+        decision = Decision(7, 15, "AD", draft, "test", 1, 18, [], description_ready_at=8)
+        shots = [Shot(1, 0, 15)]
+        unchanged = replace(decision)
+
+        [held] = prepare_ad_cues([decision], shots, [], lambda _: '{"description":"WAIT","dialogue_reference":""}')
+        [failed] = prepare_ad_cues([unchanged], shots, [], lambda _: "invalid")
+
+        self.assertEqual((decision.decision, decision.description, decision.reason), ("WAIT", "", "ad_preparer_wait"))
+        self.assertEqual(held["status"], "wait")
+        self.assertEqual((unchanged.decision, unchanged.description), ("AD", draft))
+        self.assertEqual(failed["status"], "fallback")
+
+    def test_ad_preparer_skips_an_action_already_spoken_with_the_same_details(self) -> None:
+        draft = "A person closes the window."
+        decision = Decision(7, 15, "AD", draft, "test", 1, 18, [], description_ready_at=8)
+        shots = [Shot(1, 0, 15)]
+        words = [Word(6, 7, "She closes the window.")]
+
+        def unexpected(_):
+            self.fail("An identical spoken action reached the model")
+
+        [held] = prepare_ad_cues([replace(decision)], shots, words, unexpected)
+        richer = replace(decision, description="A person closes the window with both hands.")
+        [kept] = prepare_ad_cues([richer], shots, words, lambda _: "invalid")
+
+        self.assertEqual(held["status"], "wait")
+        self.assertEqual(held["hold_reason"], "already_communicated_by_dialogue")
+        self.assertIsNone(held["llm_input"])
+        self.assertEqual(kept["description"], "A person closes the window with both hands.")
+
+    def test_ad_preparer_records_the_prompt_it_passes_to_llama_cpp(self) -> None:
+        draft = "A person shows a card marked <Hi>."
+        decision = Decision(7, 15, "AD", draft, "test", 1, 18, [], description_ready_at=8)
+        response = SimpleNamespace(stdout=json.dumps({"description": draft, "dialogue_reference": ""}))
+        with patch("offline_ad_poc.ad_preparer.subprocess.run", return_value=response) as subprocess_run:
+            [record] = prepare_ad_cues(
+                [decision], [Shot(1, 0, 15)], [], lambda llm_input: run_qwen_cue(
+                    "llama-completion", Path("test.gguf"), llm_input,
+                ),
+                build_input=build_qwen_cue_input,
+            )
+
+        request = record["llm_input"]
+        args = subprocess_run.call_args.args[0]
+        self.assertIn(request["system_prompt"], args[args.index("-p") + 1])
+        self.assertIn(request["user_prompt"], args[args.index("-p") + 1])
+        self.assertEqual(json.loads(request["user_prompt"]), record["context"])
+        self.assertIn(r"\u003c", request["user_prompt"])
+        self.assertEqual(json.loads(args[args.index("--json-schema") + 1]), request["response_schema"])
+        self.assertEqual(record["status"], "prepared")
+
+    def test_smolvlm_keeps_complete_evidence_when_the_generation_cap_is_reached(self) -> None:
+        raw = "A hand rests in shallow water.\nA cluster of eggs covers the palm.\nA person is holding a"
+        evidence, fallback = caption_texts(raw, reached_token_limit=True)
+
+        self.assertEqual(evidence, "A hand rests in shallow water. A cluster of eggs covers the palm.")
+        self.assertEqual(fallback, "A hand rests in shallow water.")
+
+    def test_ad_preparer_receives_visual_evidence_beyond_the_fallback_caption(self) -> None:
+        short = "A person shows an egg mass."
+        evidence = short + " " + "Reeds rise around the hands in the shallow water. " * 6 + "Small specks cover the palm."
+        decision = Decision(7, 15, "AD", short, "test", 1, 18, [],
+                            gap_index=1, selected_window=1, description_ready_at=8)
+        decision.visual_proposals = [{"window_index": 1, "description": short, "visual_evidence": evidence}]
+        [record] = prepare_ad_cues([decision], [Shot(1, 0, 15)], [], lambda _: json.dumps({
+            "description": short, "dialogue_reference": "",
+        }))
+
+        self.assertEqual(record["context"]["draft"], evidence)
+        self.assertEqual(record["description"], short)
+
+    @patch("offline_ad_poc.pipeline.sample_event_evidence_frames")
+    def test_qwen_defers_short_gap_word_limit_to_the_ad_preparer_when_enabled(self, sample) -> None:
+        frame = EvidenceFrame("frog.jpg", 71.9, 71.9, 1, 1)
+        sample.return_value = [frame]
+        gap = Gap(71.75, 73.69, 4)
+        backend = Qwen25Backend.__new__(Qwen25Backend)
+        draft = "A small dark frog sits in a person's hands."
+        event = {
+            "kind": "detail", "important": True, "already_audible": False, "uncertain": False,
+            "frame_ids": [1], "ready_frame_id": 1, "description": draft,
+        }
+
+        with patch.object(backend, "_generate", return_value=json.dumps(event)) as generate:
+            gated = backend.decide([frame], gap, "", [], {})
+            self.assertEqual(gated["decision"], "WAIT")
+            self.assertEqual(generate.call_count, 2)
+            [decision] = make_decisions(
+                Path("frog.mp4"), [gap], [Shot(1, 70, 74)], [], [], backend, Path("frames"), 1,
+                defer_word_budget=True,
+            )
+            self.assertEqual(generate.call_count, 3)
+        self.assertEqual(decision.description, draft)
+
+        [held] = prepare_ad_cues([replace(decision)], [], [], lambda _: "")
+        [prepared] = prepare_ad_cues(
+            [decision], [], [], lambda _: '{"description":"A frog sits.","dialogue_reference":""}',
+        )
+        self.assertEqual(held["hold_reason"], "no_complete_description_within_word_budget")
+        self.assertEqual(prepared["context"]["draft"], draft)
+        self.assertEqual(decision.description, "A frog sits.")
+
+    def test_ad_preparer_keeps_earlier_cues_and_dialogue_scoped_to_the_anchor(self) -> None:
+        decisions = [
+            Decision(3, 7, "AD", "A bird lands.", "test", 1, 18, [], description_ready_at=4),
+            Decision(12, 16, "AD", "A person opens a box.", "test", 1, 18, [], description_ready_at=13),
+            Decision(14, 18, "AD", "A person lifts a glass.", "test", 1, 18, [], description_ready_at=15),
+        ]
+        shots = [Shot(1, 0, 10), Shot(2, 10, 20)]
+        scenes = [Scene(1, 0, 10, [1], 0), Scene(2, 10, 20, [2], 0)]
+        words = [Word(8, 8.5, "previous"), Word(13.5, 14, "nearby"), Word(16, 17, "future")]
+        rows = prepare_ad_cues(decisions, shots, words, lambda context: json.dumps({
+            "description": context["draft"], "dialogue_reference": "",
+        }), scenes=scenes)
+        context = rows[2]["context"]
+
+        self.assertEqual(context["dialogue"], "nearby")
+        self.assertEqual(context["previous_dialogue"], "previous")
+        self.assertEqual(context["previous_ad"], "A person opens a box.")
+        self.assertEqual(context["current_scene"], {"id": 2, "start": 10, "end": 20})
+        self.assertEqual(context["scene_previous_ads"], [{"time": 13, "text": "A person opens a box."}])
+
+    def test_ad_preparer_thinking_and_final_json_have_separate_limits(self) -> None:
+        request = build_qwen_cue_input(
+            {"draft": "A person opens a box.", "max_words": 8, "incomplete": False, "identifying_dialogue": []},
+            reasoning_tokens=128,
+        )
+        final_json = '{"description":"A person opens a box.","dialogue_reference":""}'
+        responses = [SimpleNamespace(stdout="Planning text.</think> trailing text"), SimpleNamespace(stdout=final_json)]
+        with patch("offline_ad_poc.ad_preparer.subprocess.run", side_effect=responses) as subprocess_run:
+            result = run_qwen_cue("llama-completion", Path("test.gguf"), request)
+
+        thinking, final = [call.args[0] for call in subprocess_run.call_args_list]
+        self.assertEqual(thinking[thinking.index("-n") + 1], "128")
+        self.assertEqual(final[final.index("-n") + 1], "72")
+        self.assertIn("<think>\nPlanning text.\n</think>", final[final.index("-p") + 1])
+        self.assertEqual(result, final_json)
 
     def test_scene_split_uses_combined_boundary_score(self) -> None:
         shots = [Shot(1, 0, 2, transcript="same words"), Shot(2, 2, 4, transcript="different topic")]
@@ -116,10 +387,12 @@ class PipelineUnitTests(unittest.TestCase):
                 writer.release()
 
             shots = _detect_shots_opencv(video_path, duration=2.0, threshold=20.0)
+            report = create_shot_boundary_evidence(video_path, shots, Path(directory) / "evidence", 2.0)
 
         self.assertEqual(len(shots), 2)
         self.assertAlmostEqual(shots[0].end, 1.0, places=1)
         self.assertAlmostEqual(shots[1].start, 1.0, places=1)
+        self.assertEqual(report["near_blank_intervals"], [{"start": 0.0, "end": 1.0}])
 
     def test_merge_intervals_keeps_distant_regions_separate(self) -> None:
         merged = merge_intervals([Interval(0, 1), Interval(1.2, 2), Interval(4, 5)], maximum_gap=0.3)
@@ -177,6 +450,42 @@ class PipelineUnitTests(unittest.TestCase):
             result = backend.decide(frames, Gap(1, 4, 8), "", [], {})
         self.assertEqual(result["reason"], "already_communicated_by_dialogue")
 
+    def test_action_anchor_cannot_use_near_blank_lanta_frame(self) -> None:
+        backend = Qwen25Backend.__new__(Qwen25Backend)
+        frames = [
+            EvidenceFrame("context.jpg", 31.031, 31.031, 2, 1),
+            EvidenceFrame("title.jpg", 33.967267, 33.967267, 2, 1),
+            EvidenceFrame("fade.jpg", 35.869167, 35.869167, 2, 1, near_blank=True),
+            EvidenceFrame("room.jpg", 38.772067, 38.772067, 2, 1),
+        ]
+        gap = Gap(32.042, 42.656, 20)
+        invalid = {
+            "kind": "action", "important": True, "already_audible": False, "uncertain": False,
+            "frame_ids": [3, 4], "ready_frame_id": 3, "description": "A woman crosses the room.",
+        }
+        corrected = {**invalid, "frame_ids": [4], "ready_frame_id": 4}
+        with patch.object(backend, "_generate", side_effect=map(json.dumps, [invalid, corrected])) as generate:
+            result = backend.decide(frames, gap, "", [], {})
+        self.assertEqual(result["decision"], "AD")
+        self.assertEqual(result["description_ready_at"], 38.772067)
+        self.assertIn("Near-blank image 3", result["attempts"][0]["validation_error"])
+        retry_prompt = generate.call_args.args[1][-1]["text"]
+        self.assertIn("as evidence: 2, 3, 4", retry_prompt)
+        self.assertIn("For an action ready_frame_id, use only these IDs: 2, 4", retry_prompt)
+
+        with patch.object(backend, "_generate", return_value=json.dumps(invalid)) as generate:
+            result = backend.decide(frames, gap, "", [], {})
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(result["decision"], "WAIT")
+        self.assertNotIn("description_ready_at", result)
+
+    def test_near_blank_check_preserves_visible_detail_in_dark_frame(self) -> None:
+        gray = np.full((90, 160), 2, dtype=np.uint8)
+        self.assertTrue(is_near_blank(gray))
+        gray[:, :16] = 40
+        self.assertLess(gray.mean(), 12)
+        self.assertFalse(is_near_blank(gray))
+
     @patch("offline_ad_poc.pipeline.sample_event_evidence_frames")
     def test_long_gap_evaluates_middle_window_and_places_from_first_complete_frame(self, sample) -> None:
         def sample_midpoint(video, window, shots, scenes, boundaries, directory, **kwargs):
@@ -217,6 +526,7 @@ class PipelineUnitTests(unittest.TestCase):
             ):
                 synthesize_decisions([late], Path(directory), "transformers", None, "model", "cpu", "ffprobe")
         self.assertEqual(late.decision, "WAIT")
+        self.assertEqual(late.reason, "TTS could not fit a safe post-event slot")
         self.assertEqual(late.visual_proposals[2]["description"], "A man exits.")
 
     @patch("offline_ad_poc.pipeline.sample_event_evidence_frames")

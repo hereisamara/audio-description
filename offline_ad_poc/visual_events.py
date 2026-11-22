@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 
 EVENT_KINDS = {"none", "action", "setting", "text", "detail"}
 BOOLEAN_FIELDS = ("important", "already_audible", "uncertain")
+NARRATOR_LEAD_IN = re.compile(
+    r"^(?:(?:in (?:this|the) (?:image|picture|frame|shot)[,:\s]+)?"
+    r"(?:i|we|you) (?:can )?(?:see|notice)(?:\s+that\b)?"
+    r"|(?:this|the) (?:image|picture|frame|shot) (?:shows|depicts))(?=$|[\s,.!?;:])",
+    re.IGNORECASE,
+)
+
+
+def direct_ad_text(text: str) -> str:
+    """Keep the visual description and remove a preceding narrator phrase."""
+    text = text.strip()
+    remainder = NARRATOR_LEAD_IN.sub("", text, count=1)
+    if remainder == text:
+        return text
+    remainder = remainder.lstrip(" \t,:;").strip()
+    if not remainder.strip(".!?"):
+        return ""
+    return remainder[0].upper() + remainder[1:]
 
 
 def validate_visual_event(
@@ -14,6 +33,8 @@ def validate_visual_event(
     timestamps: Sequence[float],
     window_start: float,
     window_end: float,
+    *,
+    action_ready_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     required = {"kind", *BOOLEAN_FIELDS, "frame_ids", "ready_frame_id", "description"}
     if proposal.keys() != required:
@@ -33,6 +54,7 @@ def validate_visual_event(
         if ids or ready_id is not None or description or proposal["important"]:
             raise ValueError("A none event requires empty evidence, empty description and important=false")
         return proposal
+    description = direct_ad_text(description)
     if not ids or not description:
         raise ValueError("An event requires supporting frame IDs and a description")
     if any(type(i) is not int or not 1 <= i <= len(timestamps) for i in ids):
@@ -41,6 +63,9 @@ def validate_visual_event(
         raise ValueError("ready_frame_id must be one of the supporting IDs")
     if any(not window_start <= timestamps[i - 1] < window_end for i in ids):
         raise ValueError("Only images marked inside the current window can support an event")
+    if kind == "action" and action_ready_ids is not None and ready_id not in action_ready_ids:
+        allowed_ids = ", ".join(map(str, action_ready_ids)) or "none"
+        raise ValueError(f"Near-blank image {ready_id} cannot anchor an action. Allowed IDs: {allowed_ids}")
     return {**proposal, "frame_ids": sorted(set(ids)), "description": description}
 
 
