@@ -16,6 +16,7 @@ inputs/
 output/
 outputs/
 work/
+references/
 artifacts/
 tmp/
 
@@ -66,5 +67,37 @@ slurm-*.err
 # Secrets
 .env
 .env.*
-!.env.example
 
+
+# Local accounts, tools, and editor context
+AGENTS.md
+.codex/
+.agents/
+.aws/
+.ssh/
+.netrc
+*.pem
+*.key
+*.local.*
+.docker/
+audio_ad*.out
+audio_ad*.err
+asr_compare*.out
+asr_compare*.err
+vlm_frame_sweep*.out
+vlm_frame_sweep*.err
+
+# Archives, local databases, and additional generated media
+*.tar
+*.tar.gz
+*.zip
+*.db
+*.db-shm
+*.db-wal
+*.webp
+*.[mM][pP]4
+*.[mM][oO][vV]
+
+# Reviewed README screenshots
+!/docs/images/studio-review.jpg
+!/docs/images/studio-evidence.jpg

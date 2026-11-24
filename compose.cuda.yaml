@@ -1,0 +1,13 @@
+x-cuda: &cuda
+  platform: linux/amd64
+  build:
+    target: worker-cuda
+  gpus: all
+
+services:
+  whisper:
+    <<: *cuda
+    command: ["python", "-m", "offline_ad_poc.job_worker", "whisper", "--data", "/data", "--models", "/models"]
+  ad-maker:
+    <<: *cuda
+    command: ["python", "-m", "offline_ad_poc.job_worker", "ad", "--data", "/data", "--models", "/models"]

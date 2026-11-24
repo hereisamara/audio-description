@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AD Review Studio</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="mark" aria-hidden="true">AD</span><span>Review Studio</span></div>
+    <span id="host" class="host">Browser workspace</span>
+    <button id="example" class="quiet" hidden>Open sample</button>
+    <label class="button quiet">Import video<input id="video-file" type="file" accept="video/mp4,.mp4"></label>
+    <label class="button primary">Import run<input id="folder" type="file" webkitdirectory multiple></label>
+  </header>
+  <main>
+    <div class="project">
+      <div><p class="label">Audio description workspace</p><h1 id="title">Untitled review</h1></div>
+      <p class="muted" id="run-info">Import a finished run or start from a video.</p>
+    </div>
+    <p id="notice" class="notice" role="status" hidden></p>
+    <section class="workspace">
+      <section class="panel player-panel" aria-labelledby="preview-title">
+        <div class="panel-head"><h2 id="preview-title">Preview</h2><span id="time" class="time">00:00.000</span></div>
+        <div class="screen">
+          <video id="video" controls playsinline preload="metadata" aria-label="Video preview" hidden></video>
+          <audio id="narration-audio" preload="none" hidden></audio>
+          <div id="empty-video" class="empty-video">
+            <span class="play-mark" aria-hidden="true">▶</span><strong>Open a video to begin</strong>
+            <span>Import an MP4 or a run folder with the model outputs.</span>
+          </div>
+          <div id="caption" class="caption" aria-live="off" hidden></div>
+        </div>
+        <div class="preview-tools">
+          <label>Captions<select id="caption-mode">
+            <option value="off">Off</option><option value="ad">English AD</option>
+            <option value="adThai">Thai AD</option><option value="bilingual">English + Thai AD</option>
+            <option value="dialogue">Dialogue</option><option value="reference">Human AD</option>
+            <option value="both">AD + dialogue</option>
+          </select></label>
+          <label>Audio<select id="audio-track" disabled><option>Inspect audio tracks</option></select></label>
+          <button id="inspect-audio" class="quiet" disabled>Inspect audio</button>
+          <button id="play-audio" class="quiet" disabled>Play mix</button>
+        </div>
+        <div class="preview-tools narration-tools">
+          <button id="translate-ad" class="quiet" disabled>Translate AD to Thai</button>
+          <label>Narration<select id="narration-language">
+            <option value="en">English</option><option value="th">ไทย (Thai)</option>
+          </select></label>
+          <button id="generate-audio" class="quiet" disabled>Generate AD audio</button>
+          <button id="download-audio" class="quiet" disabled>Download audio mix</button>
+        </div>
+        <div class="timeline" id="timeline" aria-label="Video timeline"></div>
+        <div class="timeline-detail" id="timeline-detail" aria-live="polite" hidden>
+          <div id="timeline-selection"></div>
+          <div id="timeline-raw" hidden>
+            <div id="timeline-responses"></div>
+          </div>
+        </div>
+      </section>
+      <section class="panel inspector" aria-labelledby="cues-title">
+        <div class="panel-head"><h2 id="cues-title">Cue editor</h2><button id="add-cue" class="quiet" disabled>+ Add cue</button></div>
+        <div class="tabs" aria-label="Cue type">
+          <button data-track="ad" aria-pressed="true">English AD</button>
+          <button data-track="adThai" aria-pressed="false" lang="th">คำบรรยายภาพภาษาไทย</button>
+          <button data-track="dialogue" aria-pressed="false">Dialogue</button>
+          <button data-track="reference" aria-pressed="false">Human AD</button>
+        </div>
+        <ol id="cue-list" class="cue-list"></ol>
+        <form id="editor" hidden>
+          <div class="timing">
+            <label>Start <span>(s)</span><input id="start" type="number" min="0" step="0.001" required></label>
+            <label>End <span>(s)</span><input id="end" type="number" min="0" step="0.001" required></label>
+          </div>
+          <label>Cue text<textarea id="cue-text" maxlength="3000" rows="3" required></textarea></label>
+          <div class="form-actions"><button id="delete-cue" type="button" class="quiet danger">Delete</button><button class="primary" type="submit">Save cue</button></div>
+        </form>
+        <section class="cue-input" id="cue-input" aria-labelledby="cue-input-title" hidden>
+          <h3 id="cue-input-title">LLM input</h3>
+          <p id="cue-input-note" class="muted" role="status"></p>
+          <details id="cue-input-prompt" hidden>
+            <summary>System prompt</summary>
+            <pre id="cue-input-system" tabindex="0"></pre>
+          </details>
+          <div id="cue-input-context" hidden>
+            <h4>Context fields</h4>
+            <dl id="cue-input-fields"></dl>
+            <details id="cue-input-json" hidden>
+              <summary>Exact context JSON</summary>
+              <pre id="cue-input-user" tabindex="0"></pre>
+            </details>
+          </div>
+        </section>
+        <div class="export-actions">
+          <button id="export-vtt" class="quiet" disabled>Download VTT</button>
+          <button id="export-json" class="quiet" disabled>Download edits</button>
+          <button id="export-video" class="primary" disabled>Export MP4</button>
+          <label>Export AD subtitles<select id="export-ad-captions">
+            <option value="bilingual">English and Thai</option>
+            <option value="ad">English only</option>
+            <option value="adThai">Thai only</option>
+          </select></label>
+          <label class="check"><input id="revoice" type="checkbox" disabled> Revoice edited AD on export</label>
+          <p class="muted" id="export-detail">MP4 export adds editable subtitles and keeps the selected audio mix.</p>
+        </div>
+      </section>
+    </section>
+    <div class="lower">
+      <section class="panel" aria-labelledby="outputs-title">
+        <div class="panel-head"><h2 id="outputs-title">Pipeline outputs</h2><select id="artifact" aria-label="Select a pipeline artifact"></select></div>
+        <div id="stage-summary" class="stage-summary"></div>
+        <pre id="artifact-content" tabindex="0"></pre>
+        <label class="button quiet small-import">Import subtitle or JSON files<input id="files" type="file" multiple accept=".vtt,.srt,.json"></label>
+      </section>
+      <section class="panel" aria-labelledby="jobs-title">
+        <div class="panel-head"><h2 id="jobs-title">Generate AD</h2><span class="label">App host</span></div>
+        <div class="worker">
+          <p id="worker-info" class="muted">Checking for a local worker…</p>
+          <label>Compute device<select id="device"><option value="auto">Auto</option><option value="cpu">CPU</option><option value="cuda">NVIDIA CUDA</option></select></label>
+          <label class="check"><input id="fallback" type="checkbox"> Allow CPU fallback when CUDA is unavailable</label>
+          <button id="generate" class="primary" disabled>Start job</button>
+          <div id="job-history" hidden>
+            <label>Recent jobs<select id="jobs-list"></select></label>
+            <button id="open-job" class="quiet" disabled>Open job</button>
+            <button id="refresh-jobs" class="quiet">Refresh</button>
+          </div>
+          <p id="job-state" role="status"></p>
+          <button id="load-job-dialogue" class="quiet" hidden>Inspect dialogue and gaps</button>
+          <pre id="job-log" hidden></pre>
+          <details><summary>Review a run from another host</summary><p class="muted">Use Import run to open a folder that contains the finished video and pipeline artifacts.</p></details>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

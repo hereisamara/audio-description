@@ -1,0 +1,11 @@
+**
+!offline_ad_poc/
+!offline_ad_poc/**
+!demo_app/
+!demo_app/server.py
+!demo_app/web/
+!demo_app/web/**
+**/__pycache__
+**/*.pyc
+
+!environment-gpu.yml

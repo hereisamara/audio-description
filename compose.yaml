@@ -1,0 +1,56 @@
+x-worker-cpu-environment: &worker-cpu-environment
+  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+  OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: deployment/Dockerfile
+    target: worker
+  init: true
+  restart: unless-stopped
+  volumes:
+    - job-data:/data
+    - ./models:/models:ro
+
+services:
+  studio:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+      target: studio
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${STUDIO_PORT:-7860}:7860"
+    volumes:
+      - job-data:/data
+
+  whisper:
+    <<: *worker
+    command: ["python", "-m", "offline_ad_poc.job_worker", "whisper", "--data", "/data", "--models", "/models", "--cpu-only"]
+    environment:
+      <<: *worker-cpu-environment
+      AD_PROFILE: ${AD_PROFILE:-auto}
+      ASR_MODEL: ${ASR_MODEL:-}
+
+  ad-maker:
+    <<: *worker
+    command: ["python", "-m", "offline_ad_poc.job_worker", "ad", "--data", "/data", "--models", "/models", "--cpu-only"]
+    environment:
+      <<: *worker-cpu-environment
+      AD_PROFILE: ${AD_PROFILE:-auto}
+      VLM_MODEL: ${VLM_MODEL:-}
+      VLM_MMPROJ: ${VLM_MMPROJ:-}
+      VLM_EXECUTABLE: ${VLM_EXECUTABLE:-}
+      TTS_MODEL: ${TTS_MODEL:-}
+      AD_PREPARER: ${AD_PREPARER:-auto}
+      AD_PREPARER_EXECUTABLE: ${AD_PREPARER_EXECUTABLE:-}
+      AD_PREPARER_MODEL: ${AD_PREPARER_MODEL:-}
+      AD_PREPARER_REASONING_TOKENS: ${AD_PREPARER_REASONING_TOKENS:-}
+      EVIDENCE_FRAMES: ${EVIDENCE_FRAMES:-}
+      EVIDENCE_MAX_EDGE: ${EVIDENCE_MAX_EDGE:-}
+      EVENT_FOLLOWUPS: ${EVENT_FOLLOWUPS:-}
+
+volumes:
+  job-data:

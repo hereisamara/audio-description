@@ -2,8 +2,8 @@
 """Offline, CPU/GPU-portable audio-description prototype.
 
 This is a research prototype.  The heuristic backend validates the full media
-pipeline but does not claim useful visual-language quality.  The qwen25 backend
-uses only a local model directory and performs no API calls.
+pipeline but does not claim useful visual-language quality. The Qwen backends
+use local checkpoints and perform no API calls.
 """
 
 from __future__ import annotations
@@ -24,14 +24,18 @@ import wave
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
 
+from .ad_preparer import DEFAULT_REASONING_TOKENS, build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from .knowledge_db import EvidenceStore
+from .smolvlm import DEFAULT_MAX_NEW_TOKENS
+from .visual_events import apply_ad_policy, description_sentences, direct_ad_text, validate_visual_event
 
 
 LOGGER = logging.getLogger("offline_ad_poc")
@@ -333,6 +337,7 @@ class EvidenceFrame:
     scene_id: int | None
     salience: float = 0.0
     role: str = "gap"
+    near_blank: bool = False
 
 
 @dataclass
@@ -353,8 +358,17 @@ class Decision:
     placement_method: str = "unplaced"
     tts_path: str = ""
     tts_duration: float = 0.0
+    tts_attempts: list[dict[str, Any]] = field(default_factory=list)
     cue_start: float = 0.0
     cue_end: float = 0.0
+    description_ready_at: float | None = None
+    visual_proposals: list[dict[str, Any]] = field(default_factory=list)
+    selected_window: int | None = None
+    gap_index: int | None = None
+    visual_followups: list[dict[str, Any]] = field(default_factory=list)
+    fallback_scene_id: int | None = None
+    overlaps_dialogue: bool = False
+    dialogue_overlap_seconds: float = 0.0
 
 
 def run_command(args: Sequence[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -434,6 +448,17 @@ def extract_analysis_audio(input_video: Path, output_wav: Path, ffmpeg: str) -> 
             str(output_wav),
         ]
     )
+
+
+def analysis_audio_is_silent(wav_path: Path) -> bool:
+    """Check the extracted 16-bit PCM for digital silence in bounded reads."""
+    with wave.open(str(wav_path), "rb") as source:
+        if source.getsampwidth() != 2:
+            return False
+        while frames := source.readframes(65536):
+            if np.frombuffer(frames, dtype="<i2").any():
+                return False
+    return True
 
 
 def choose_device(requested: str) -> str:
@@ -713,23 +738,38 @@ def build_gaps(
     minimum_duration: float = 1.5,
     safety_margin: float = 0.20,
     words_per_second: float = 2.5,
+    *,
+    audit: list[dict[str, Any]] | None = None,
 ) -> list[Gap]:
     gaps: list[Gap] = []
+
+    def scan(start: float, end: float) -> None:
+        span = end - start
+        if span <= 0:
+            return
+        usable_start = start + safety_margin
+        usable_end = end - safety_margin
+        usable_seconds = max(0.0, usable_end - usable_start)
+        gap_index = None
+        reason = "gap_too_short" if span < minimum_duration else "gap_too_short_after_padding"
+        if span >= minimum_duration and usable_seconds >= minimum_duration:
+            budget = max(1, math.floor(usable_seconds * words_per_second))
+            gaps.append(Gap(usable_start, usable_end, budget))
+            gap_index = len(gaps)
+            reason = "eligible_gap"
+        if audit is not None:
+            audit.append({
+                "start": start, "end": end, "gap_index": gap_index,
+                "usable_seconds": usable_seconds, "minimum_seconds": minimum_duration,
+                "status": "eligible" if gap_index is not None else "not_scanned",
+                "reason": reason,
+            })
+
     cursor = 0.0
     for interval in speech:
-        if interval.start - cursor >= minimum_duration:
-            usable_start = cursor + safety_margin
-            usable_end = interval.start - safety_margin
-            if usable_end - usable_start >= minimum_duration:
-                budget = max(1, math.floor((usable_end - usable_start) * words_per_second))
-                gaps.append(Gap(usable_start, usable_end, budget))
+        scan(cursor, interval.start)
         cursor = max(cursor, interval.end)
-    if duration - cursor >= minimum_duration:
-        usable_start = cursor + safety_margin
-        usable_end = max(usable_start, duration - safety_margin)
-        if usable_end - usable_start >= minimum_duration:
-            budget = max(1, math.floor((usable_end - usable_start) * words_per_second))
-            gaps.append(Gap(usable_start, usable_end, budget))
+    scan(cursor, duration)
     return gaps
 
 
@@ -889,6 +929,14 @@ def validate_shot_timeline(shots: Sequence[Shot], duration: float) -> dict[str, 
     }
 
 
+def is_near_blank(gray: np.ndarray) -> bool:
+    """Flag frames with very low brightness and almost no brighter detail."""
+    return bool(
+        gray.mean() < 12
+        and cv2.countNonZero(cv2.compare(gray, 24, cv2.CMP_GT)) <= 0.05 * gray.size
+    )
+
+
 def create_shot_boundary_evidence(
     video_path: Path,
     shots: Sequence[Shot],
@@ -969,12 +1017,29 @@ def create_shot_boundary_evidence(
     previous: np.ndarray | None = None
     frame_index = 0
     scored_candidates: list[tuple[float, float]] = []
+    near_blank_intervals: list[dict[str, float]] = []
+    dark_start: int | None = None
+    minimum_dark_frames = math.ceil(0.15 * fps)
+
+    def close_dark_interval(end: int) -> None:
+        if dark_start is not None and end - dark_start >= minimum_dark_frames:
+            near_blank_intervals.append({
+                "start": round(dark_start / fps, 6),
+                "end": round(min(duration, end / fps), 6),
+            })
+
     try:
         while True:
             ok, frame = soft_capture.read()
             if not ok:
                 break
             gray = cv2.cvtColor(cv2.resize(frame, (160, 90)), cv2.COLOR_BGR2GRAY)
+            if is_near_blank(gray):
+                if dark_start is None:
+                    dark_start = frame_index
+            elif dark_start is not None:
+                close_dark_interval(frame_index)
+                dark_start = None
             if previous is not None:
                 score = float(np.mean(cv2.absdiff(previous, gray)))
                 timestamp = frame_index / fps
@@ -984,6 +1049,7 @@ def create_shot_boundary_evidence(
             frame_index += 1
     finally:
         soft_capture.release()
+    close_dark_interval(frame_index)
     detected_boundaries = [shot.start for shot in shots[1:]]
     selected_candidates: list[tuple[float, float]] = []
     for score, timestamp in sorted(scored_candidates, reverse=True):
@@ -1031,6 +1097,7 @@ def create_shot_boundary_evidence(
     report["validation_passed"] = report["valid_timeline"] and report["evidence_complete"]
     report["soft_candidates_requiring_review"] = soft_evidence
     report["soft_candidate_count"] = len(soft_evidence)
+    report["near_blank_intervals"] = near_blank_intervals
     LOGGER.info(
         "method stage=shot_boundary_validation backend=before_after_evidence "
         "boundaries=%d decoded=%d valid_timeline=%s evidence_complete=%s "
@@ -1280,6 +1347,7 @@ def sample_event_evidence_frames(
     output_dir: Path,
     maximum_frames: int = 6,
     max_edge: int | None = None,
+    coverage_first: bool = False,
 ) -> list[EvidenceFrame]:
     """Select timestamped frames using local change and boundary evidence."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1330,6 +1398,7 @@ def sample_event_evidence_frames(
                     "timestamp": timestamp,
                     "salience": change + boundary_bonus,
                     "role": role,
+                    "near_blank": is_near_blank(gray),
                 }
             )
             previous_gray = gray
@@ -1339,12 +1408,26 @@ def sample_event_evidence_frames(
     if not decoded:
         return []
 
-    required_indices = {0, len(decoded) - 1}
-    first_inside = next(
-        (index for index, item in enumerate(decoded) if item["requested"] >= gap.start),
-        0,
-    )
-    required_indices.add(first_inside)
+    if coverage_first:
+        # Reserve one frame in each time bin before filling remaining slots by salience.
+        bin_count = min(4, maximum_frames - 1)
+        bins: list[list[int]] = [[] for _ in range(bin_count)]
+        for index, item in enumerate(decoded):
+            if gap.start <= item["timestamp"] < gap.end:
+                fraction = (item["timestamp"] - gap.start) / gap.duration
+                bins[min(bin_count - 1, int(fraction * bin_count))].append(index)
+        required_indices = {max(group, key=lambda i: decoded[i]["salience"]) for group in bins if group}
+        if decoded[0]["timestamp"] < gap.start:
+            required_indices.add(0)
+        if bins[-1] and len(required_indices) < maximum_frames:
+            required_indices.add(bins[-1][-1])
+    else:
+        required_indices = {0, len(decoded) - 1}
+        first_inside = next(
+            (index for index, item in enumerate(decoded) if item["requested"] >= gap.start),
+            0,
+        )
+        required_indices.add(first_inside)
     ranked = sorted(
         range(len(decoded)),
         key=lambda index: (decoded[index]["salience"], -decoded[index]["requested"]),
@@ -1370,7 +1453,8 @@ def sample_event_evidence_frames(
         frame = resize_frame_max_edge(item["frame"], max_edge)
         timestamp = float(item["timestamp"])
         path = output_dir / f"frame-{output_index:02d}-{timestamp:.3f}.jpg"
-        cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        if not cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
+            raise OSError(f"Could not write evidence frame {path}")
         shot_id, scene_id = _shot_scene_at(timestamp, shots, scenes)
         evidence.append(
             EvidenceFrame(
@@ -1381,6 +1465,7 @@ def sample_event_evidence_frames(
                 scene_id=scene_id,
                 salience=round(float(item["salience"]), 6),
                 role=str(item["role"]),
+                near_blank=bool(item["near_blank"]),
             )
         )
     return evidence
@@ -1395,6 +1480,8 @@ def json_object_from_text(text: str) -> dict[str, Any]:
 
 
 class VisualBackend:
+    uses_event_windows = False
+
     def decide(
         self,
         frames: Sequence[EvidenceFrame],
@@ -1467,49 +1554,161 @@ def expand_qwen_image_tokens(
     image_grid_thw: Sequence[Sequence[int]],
     merge_size: int,
 ) -> str:
-    expanded = chat_text
-    for grid in image_grid_thw:
+    parts = chat_text.split(image_token)
+    if len(parts) - 1 != len(image_grid_thw):
+        raise ValueError("Qwen image placeholder count does not match the image grid count")
+    expanded = [parts[0]]
+    for grid, suffix in zip(image_grid_thw, parts[1:]):
         token_count = math.prod(int(value) for value in grid) // (merge_size**2)
-        if image_token not in expanded:
-            raise ValueError("Qwen chat template did not emit enough image placeholder tokens")
-        expanded = expanded.replace(image_token, image_token * token_count, 1)
-    return expanded
+        expanded.extend((image_token * token_count, suffix))
+    return "".join(expanded)
 
 
-class Qwen25Backend(VisualBackend):
-    def __init__(self, model_path: str, device: str) -> None:
-        try:
-            import torch
-            from PIL import Image
-            from transformers import (
-                AutoImageProcessor,
-                AutoTokenizer,
-                Qwen2_5_VLForConditionalGeneration,
+class QwenEventBackend(VisualBackend):
+    uses_event_windows = True
+
+    def decide(
+        self,
+        frames: Sequence[EvidenceFrame],
+        gap: Gap,
+        transcript: str,
+        previous_ad: Sequence[str],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        evidence_ids = [index for index, frame in enumerate(frames, 1) if gap.start <= frame.timestamp < gap.end]
+        if not evidence_ids:
+            return {"decision": "WAIT", "reason": "no_in_window_evidence", "attempts": []}
+        action_ready_ids = [index for index in evidence_ids if not frames[index - 1].near_blank]
+        expected_ids = ", ".join(map(str, evidence_ids))
+        action_ids = ", ".join(map(str, action_ready_ids)) or "none"
+        defer_word_budget = context.get("defer_word_budget") and not context.get("refine_description")
+        word_limit = 32 if defer_word_budget else min(18, gap.word_budget)
+        description_instruction = (
+            "In description, write one short sentence about the main visible action or detail. "
+            "Use a second sentence only if it adds a separate detail essential to following the scene. "
+            "Skip lists of clothing, objects, or background details unless they matter to the event. "
+            f"Use at most two sentences and {word_limit} words total. "
+        )
+        if context.get("scene_fallback"):
+            description_instruction += "Describe the main new visible detail of this scene in one concise line. "
+        history_instruction = (
+            f"Earlier proposed narration: {' | '.join(previous_ad[-3:]) or 'none'}."
+            if not context.get("defer_word_budget") else ""
+        )
+        prompt = (
+            "Identify the strongest new visible event or informative detail in the numbered film images. "
+            "A cut alone is not an event. Describe only supported facts in the present tense. "
+            "Set important=true when the detail helps someone follow the film. "
+            "Set already_audible=true when the dialogue communicates the same information. "
+            "Identify each object from the current numbered images. Dialogue may help identify a visible object. "
+            "Return one JSON object using this example and no additional text: "
+            '{"kind":"action","important":true,"already_audible":false,"uncertain":false,'
+            '"frame_ids":[2,3],"ready_frame_id":3,"description":"A woman stands."} '
+            "kind is one of none, action, setting, text, detail. "
+            f"Use only these integer image IDs as evidence: {expected_ids}. "
+            f"For an action ready_frame_id, use only these IDs: {action_ids}. "
+            "Near-blank images may show a transition but cannot anchor a visible action. "
+            "ready_frame_id is the first supporting image where the complete description is apparent. "
+            "For kind=none use important=false, frame_ids=[], ready_frame_id=null, description=\"\". "
+            f"{description_instruction}"
+            f"Recent dialogue: {transcript or 'none'}. "
+            f"{history_instruction}"
+        )
+        content: list[dict[str, Any]] = []
+        for index, frame in enumerate(frames, start=1):
+            role = "context only"
+            if index in evidence_ids:
+                role = "inside window, near-blank" if frame.near_blank else "inside window"
+            content.append({"type": "image", "image": str(Path(frame.path).resolve())})
+            content.append({"type": "text", "text": f"Image ID {index} ({role})."})
+        timestamps = [frame.timestamp for frame in frames]
+        attempts: list[dict[str, Any]] = []
+        instruction = prompt
+        if context.get("refine_description"):
+            prompt += (
+                "\nRecheck this specific event: " + json.dumps(context["refine_description"])
+                + ". Find a shorter description of the same action that the earliest available frame "
+                "clearly supports. Return kind=none if there is no such evidence."
             )
-        except ImportError as exc:
-            raise RuntimeError(
-                "Qwen backend requires the Conda pytorch, transformers, accelerate, and Pillow packages."
-            ) from exc
+            instruction = prompt
+        for _ in range(1 if context.get("refine_description") else 2):
+            attempt = {"prompt": instruction, "recent_dialogue": transcript}
+            try:
+                decoded = self._generate(frames, [*content, {"type": "text", "text": instruction}])
+            except Exception as exc:
+                LOGGER.exception("vlm_generation_failure window=%.3f-%.3f", gap.start, gap.end)
+                attempts.append({**attempt, "generation_error": f"{type(exc).__name__}: {exc}"})
+                return {"decision": "WAIT", "reason": "vlm_generation_failure", "attempts": attempts}
+            try:
+                proposal = validate_visual_event(
+                    json_object_from_text(decoded), timestamps, gap.start, gap.end,
+                    action_ready_ids=action_ready_ids,
+                )
+                description = proposal["description"]
+                if len(description_sentences(description)) > 2:
+                    raise ValueError("description exceeds the two-sentence limit")
+                if len(description.split()) > word_limit:
+                    raise ValueError(f"description exceeds the {word_limit}-word budget")
+            except ValueError as exc:
+                attempts.append({**attempt, "raw_output": decoded, "validation_error": str(exc)})
+                LOGGER.warning("vlm_event_invalid window=%.3f-%.3f attempt=%d error=%s",
+                               gap.start, gap.end, len(attempts), exc)
+                instruction = f"{prompt}\nThe previous answer failed validation: {exc}. Correct it."
+                continue
+            attempts.append({**attempt, "raw_output": decoded})
+            return {**apply_ad_policy(proposal, timestamps), "proposal": proposal, "attempts": attempts}
+        return {"decision": "WAIT", "reason": "invalid_vlm_output", "attempts": attempts}
+
+    def compare_events(
+        self, frames: Sequence[EvidenceFrame], split: int, left: str, right: str
+    ) -> dict[str, Any]:
+        content = []
+        for index, frame in enumerate(frames):
+            group = "A" if index < split else "B"
+            content.extend([
+                {"type": "text", "text": f"Event {group}."},
+                {"type": "image", "image": str(Path(frame.path).resolve())},
+            ])
+        content.append({
+            "type": "text",
+            "text": (
+                "Compare the two groups of film images. Do they show the same occurrence "
+                "of an action or two separate events? A new camera angle can continue an action. "
+                "Repeated actions at separate times are distinct. "
+                f"Candidate A: {json.dumps(left)}. Candidate B: {json.dumps(right)}. "
+                'Return only {"relation":"same"}, {"relation":"distinct"}, or '
+                '{"relation":"uncertain"} if the images cannot settle it.'
+            ),
+        })
+        decoded = self._generate(frames, content)
+        try:
+            relation = json_object_from_text(decoded).get("relation")
+            if relation not in ("same", "distinct", "uncertain"):
+                raise ValueError("Expected a valid event relation")
+        except ValueError as exc:
+            return {"relation": "uncertain", "raw_output": decoded, "validation_error": str(exc)}
+        return {"relation": relation, "raw_output": decoded}
+
+    def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
+        raise NotImplementedError
+
+
+class QwenTransformersBackend(QwenEventBackend):
+    """Shared image-only Transformers path for Qwen2.5-VL and Qwen3-VL."""
+
+    def __init__(self, model_path: str, model_class: Any, **model_kwargs: Any) -> None:
+        import torch
+        from PIL import Image
+        from transformers import AutoImageProcessor, AutoTokenizer
+
         self.torch = torch
         self.image_type = Image
-        self.device = device
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": dtype,
-            "local_files_only": True,
-            "low_cpu_mem_usage": True,
-        }
-        if device == "cuda":
-            model_kwargs["device_map"] = "auto"
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **model_kwargs)
-        if device == "cpu":
-            self.model.to("cpu")
-        self.model.eval()
+        self.model = model_class.from_pretrained(
+            model_path, local_files_only=True, low_cpu_mem_usage=True, **model_kwargs,
+        ).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         self.image_processor = AutoImageProcessor.from_pretrained(
-            model_path,
-            local_files_only=True,
-            use_fast=False,
+            model_path, local_files_only=True, use_fast=False,
         )
         self.processed_image_grids: list[list[list[int]]] = []
         self.vision_tokens = 0
@@ -1520,54 +1719,7 @@ class Qwen25Backend(VisualBackend):
             "qwen_vision_tokens": self.vision_tokens,
         }
 
-    def decide(
-        self,
-        frames: Sequence[EvidenceFrame],
-        gap: Gap,
-        transcript: str,
-        previous_ad: Sequence[str],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        frame_index = ", ".join(
-            f"{index}={frame.timestamp:.3f}s ({frame.role}, salience={frame.salience:.3f})"
-            for index, frame in enumerate(frames, start=1)
-        )
-        retrieved_boundaries = context.get("knowledge", {}).get("boundaries", [])
-        boundary_index = ", ".join(
-            f"{item['timestamp']:.3f}s:{item['kind']}"
-            for item in retrieved_boundaries
-        ) or "none"
-        prompt = (
-            "You are deciding whether an audio description is needed in a speech-free film interval. "
-            "Each ordered image has an explicit timestamp in the frame index below. "
-            "Use only visible evidence from those frames. Return WAIT for static, redundant, "
-            "incomplete, uncertain, or unimportant content. Return AD only for meaningful new action, "
-            "location change, character behaviour, or an important visual detail not conveyed by audio. "
-            f"The safe gap is {gap.duration:.2f} seconds and the maximum is {gap.word_budget} words. "
-            f"Safe gap timestamps: {gap.start:.3f}s to {gap.end:.3f}s. "
-            f"Frame index: {frame_index or 'none'}. "
-            f"Local transition evidence: {boundary_index}. "
-            f"Recent dialogue: {transcript or 'none'}. "
-            f"Previous AD: {' | '.join(previous_ad[-3:]) or 'none'}. "
-            "Scene IDs may be too coarse, so use local visual changes instead of assuming one scene ID "
-            "means one continuous event. Never mention the camera or invent names, emotions, causes, "
-            "or off-screen facts. Return exactly one JSON object with keys decision, description, reason, "
-            "importance, event_start, event_end, evidence_timestamps. decision must be AD or WAIT. "
-            "description must be empty for WAIT. importance is 0 to 1. For AD, event_start and event_end "
-            "must be timestamps copied from the frame index, and evidence_timestamps must list the copied "
-            "timestamps that directly support the description. For WAIT, use null event times and an "
-            "empty evidence_timestamps list."
-        )
-        content: list[dict[str, Any]] = []
-        for index, frame in enumerate(frames, start=1):
-            content.append({"type": "image", "image": str(Path(frame.path).resolve())})
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"Frame {index} timestamp: {frame.timestamp:.3f}s; role: {frame.role}.",
-                }
-            )
-        content.append({"type": "text", "text": prompt})
+    def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
         messages = [{"role": "user", "content": content}]
         chat_text = self.tokenizer.apply_chat_template(
             messages,
@@ -1610,12 +1762,92 @@ class Qwen25Backend(VisualBackend):
         with self.torch.inference_mode():
             generated = self.model.generate(**inputs, max_new_tokens=160, do_sample=False)
         trimmed = [output[len(source) :] for source, output in zip(inputs["input_ids"], generated)]
-        decoded = self.tokenizer.batch_decode(
+        return self.tokenizer.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
-        return json_object_from_text(decoded)
+
+
+class Qwen25Backend(QwenTransformersBackend):
+    def __init__(self, model_path: str, device: str) -> None:
+        import torch
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        kwargs = {"torch_dtype": torch.float16 if device == "cuda" else torch.float32}
+        if device == "cuda":
+            kwargs["device_map"] = "auto"
+        super().__init__(model_path, Qwen2_5_VLForConditionalGeneration, **kwargs)
+
+
+class Qwen3VL8BBackend(QwenTransformersBackend):
+    """Run the local Transformers checkpoint on the selected NVIDIA GPU."""
+
+    def __init__(self, model_path: str, device: str) -> None:
+        import torch
+
+        if device != "cuda" or not torch.cuda.is_available():
+            raise ValueError("Qwen3-VL-8B requires CUDA. Use the Qwen3-VL-2B profile for CPU.")
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+        except ImportError as exc:
+            raise RuntimeError("Qwen3-VL-8B requires Transformers 4.57.6 or newer in the GPU Conda environment.") from exc
+        gpu = torch.cuda.current_device()
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability(gpu)[0] >= 8 else torch.float16
+        LOGGER.info("model_load backend=qwen3vl8b checkpoint=%s dtype=%s cuda_device=%d",
+                    model_path, dtype, gpu)
+        super().__init__(
+            model_path, Qwen3VLForConditionalGeneration, dtype=dtype,
+            device_map={"": gpu}, attn_implementation="sdpa", use_safetensors=True,
+        )
+
+
+class Qwen3VLBackend(QwenEventBackend):
+    """Run Qwen3-VL GGUF on CPU with the same events and prompt as Qwen2.5-VL."""
+
+    def __init__(self, model_path: str, mmproj: Path, executable: str) -> None:
+        self.model_path = Path(model_path).resolve()
+        self.mmproj = mmproj.resolve()
+        resolved = shutil.which(executable)
+        if not resolved or not self.model_path.is_file() or not self.mmproj.is_file():
+            raise ValueError("Qwen3-VL requires local GGUF weights, a vision projector, and llama-mtmd-cli")
+        self.executable = resolved
+        self.calls = 0
+        self.images = 0
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        return {"qwen3vl_calls": self.calls, "qwen3vl_images": self.images,
+                "qwen3vl_max_new_tokens": 160, "qwen3vl_cpu_threads": 4}
+
+    def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
+        marker = "<__media__>"
+        prompt = "\n".join(
+            marker if part["type"] == "image" else part["text"].replace(marker, "[media]")
+            for part in content
+        )
+        paths = [str(Path(frame.path).resolve()) for frame in frames]
+        # The mtmd CLI accepts a single comma-separated image list. Pass image
+        # paths relative to the window directory, which may itself contain commas.
+        common_dir = Path(os.path.commonpath([str(Path(path).parent) for path in paths]))
+        images = ",".join(os.path.relpath(path, common_dir) for path in paths)
+        self.calls += 1
+        self.images += len(paths)
+        result = subprocess.run(
+            [
+                self.executable, "--offline", "--device", "none", "-ngl", "0",
+                "--no-mmproj-offload", "--no-op-offload", "--no-warmup",
+                "-t", "4", "-tb", "4", "-c", "4096", "-n", "160",
+                "--temp", "0", "--seed", "42", "-m", str(self.model_path),
+                "--mmproj", str(self.mmproj), "--image", images,
+                "--json-schema", '{"type":"object"}', "-p", prompt,
+            ],
+            cwd=common_dir, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip()
+                               else f"llama-mtmd-cli exited with status {result.returncode}")
+        return result.stdout.strip()
+
 
 
 def context_for_gap(
@@ -1661,10 +1893,30 @@ def limit_words(text: str, maximum: int) -> str:
     return shortened.rstrip(".!?") + "."
 
 
-def choose_backend(name: str, model_path: str | None, device: str) -> VisualBackend:
+def choose_backend(
+    name: str, model_path: str | None, device: str, *, smolvlm_max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    vlm_mmproj: Path | None = None, vlm_executable: str = "llama-mtmd-cli",
+) -> VisualBackend:
+    if name == "smolvlm":
+        if not model_path:
+            raise ValueError("--vlm-model is required for --visual-backend smolvlm")
+        from .smolvlm import SmolVLMBackend
+
+        LOGGER.info("method stage=visual_backend backend=smolvlm device=%s", device)
+        return SmolVLMBackend(model_path, device, smolvlm_max_new_tokens)
     if name == "heuristic":
         LOGGER.info("method stage=visual_backend backend=heuristic device=cpu")
         return HeuristicBackend()
+    if name == "qwen3vl":
+        if not model_path or not vlm_mmproj:
+            raise ValueError("--vlm-model and --vlm-mmproj are required for --visual-backend qwen3vl")
+        LOGGER.info("method stage=visual_backend backend=qwen3-vl-2b device=cpu runtime=llama-mtmd-cli")
+        return Qwen3VLBackend(model_path, vlm_mmproj, vlm_executable)
+    if name == "qwen3vl8b":
+        if not model_path:
+            raise ValueError("--vlm-model is required for --visual-backend qwen3vl8b")
+        LOGGER.info("method stage=visual_backend backend=qwen3-vl-8b device=%s", device)
+        return Qwen3VL8BBackend(model_path, device)
     if name == "qwen25":
         if not model_path:
             raise ValueError("--vlm-model is required for --visual-backend qwen25")
@@ -1732,6 +1984,116 @@ def normalize_event_payload(
     return normalized
 
 
+def split_evidence_windows(gap: Gap, maximum_seconds: float = 12.0) -> list[Gap]:
+    """Cover the entire speech gap with contiguous, bounded visual windows."""
+    count = max(1, math.ceil(gap.duration / maximum_seconds))
+    edges = [gap.start + gap.duration * index / count for index in range(count)] + [gap.end]
+    return [Gap(start, end, gap.word_budget) for start, end in zip(edges, edges[1:])]
+
+
+def plan_qwen_calls(
+    gaps: Sequence[Gap], maximum_gaps: int, followups: int, seconds_per_call: float | None
+) -> dict[str, Any]:
+    initial = sum(len(split_evidence_windows(gap)) for gap in gaps[:maximum_gaps])
+    extra = followups if initial else 0
+    plan = {
+        "initial_windows": initial,
+        "max_followup_calls": extra,
+        "max_calls_including_initial_retries": 2 * initial + extra,
+    }
+    if seconds_per_call is not None:
+        plan.update(
+            seconds_per_call=seconds_per_call,
+            estimated_initial_seconds=round(initial * seconds_per_call, 3),
+            estimated_seconds_with_all_followups=round((initial + extra) * seconds_per_call, 3),
+        )
+    return plan
+
+
+def refine_gap_events(
+    candidates: list[dict[str, Any]],
+    gap: Gap,
+    backend: VisualBackend,
+    inspect_window: Callable[[Gap, str], dict[str, Any]],
+    followup_budget: int,
+    frame_limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Review only nearby potential duplicates or events with a tight narration slot."""
+    kept: list[dict[str, Any]] = []
+    reviews: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if kept:
+            previous = kept[-1]
+            distance = candidate["event_start"] - previous["event_end"]
+            before = re.findall(r"\w+", previous["description"].casefold())
+            after = re.findall(r"\w+", candidate["description"].casefold())
+            similarity = SequenceMatcher(None, before, after, autojunk=False).ratio()
+            if distance <= 0.75 and before == after:
+                reviews.append({
+                    "kind": "duplicate_text", "kept_window": previous["window_index"],
+                    "discarded_window": candidate["window_index"], "calls": 0,
+                })
+                continue
+            if (
+                distance <= 4.0
+                and similarity >= 0.5
+                and sum(item["calls"] for item in reviews) < followup_budget
+            ):
+                groups = [
+                    [frame for frame in item["frames"] if frame["timestamp"] in item["evidence_timestamps"]]
+                    for item in (previous, candidate)
+                ]
+                left, right = [group[:max(1, frame_limit // 2)] for group in groups]
+                if left and right:
+                    frames = [EvidenceFrame(**{k: v for k, v in frame.items() if k != "id"}) for frame in left + right]
+                    started = time.perf_counter()
+                    try:
+                        result = backend.compare_events(
+                            frames, len(left), previous["description"], candidate["description"]
+                        )
+                    except Exception as exc:
+                        LOGGER.exception("vlm_event_comparison_failed")
+                        result = {"relation": "uncertain", "generation_error": str(exc)}
+                    reviews.append({
+                        "kind": "compare_events", "calls": 1,
+                        "elapsed_seconds": round(time.perf_counter() - started, 6),
+                        "windows": [previous["window_index"], candidate["window_index"]],
+                        "frame_paths": [frame.path for frame in frames],
+                        **result,
+                    })
+                    if result["relation"] == "same":
+                        continue
+        kept.append(candidate)
+
+    for index, candidate in enumerate(kept):
+        if sum(item["calls"] for item in reviews) >= followup_budget:
+            break
+        ready = candidate["description_ready_at"]
+        estimated = len(candidate["description"].split()) / 2.5
+        room = gap.end - ready - 0.075
+        event_start = candidate.get("event_start", ready)
+        earlier = max(gap.start, ready - 6.0, min(ready - 3.0, event_start))
+        if room >= estimated or ready - earlier < 0.5:
+            continue
+        budget = max(1, min(len(candidate["description"].split()), int((gap.end - earlier - 0.15) * 2.5)))
+        review_window = Gap(earlier, min(gap.end, ready + 0.25), budget)
+        started = time.perf_counter()
+        refined = inspect_window(review_window, candidate["description"])
+        use_refinement = (
+            refined.get("decision") == "AD"
+            and refined["description_ready_at"] < ready
+            and len(refined["description"].split()) / 2.5 <= gap.end - refined["description_ready_at"] - 0.075
+        )
+        reviews.append({
+            "kind": "earlier_support", "calls": 1, "source_window": candidate["window_index"],
+            "review_window": refined["window_index"], "used": use_refinement,
+            "elapsed_seconds": round(time.perf_counter() - started, 6),
+        })
+        if use_refinement:
+            kept[index] = refined
+    return kept, reviews
+
+
 def make_decisions(
     video_path: Path,
     gaps: Sequence[Gap],
@@ -1745,110 +2107,214 @@ def make_decisions(
     evidence_frames_per_gap: int = 6,
     soft_candidate_timestamps: Sequence[float] = (),
     knowledge_store: EvidenceStore | None = None,
+    multi_event: bool = False,
+    followup_budget: int = 0,
+    defer_word_budget: bool = False,
+    gap_index_offset: int = 0,
+    scene_fallback: bool = False,
 ) -> list[Decision]:
     decisions: list[Decision] = []
     previous_ad: list[str] = []
-    for index, gap in enumerate(gaps[:maximum_gaps], start=1):
-        context = context_for_gap(gap, shots, scenes, soft_candidate_timestamps)
-        frames = sample_event_evidence_frames(
-            video_path,
-            gap,
-            shots,
-            scenes,
-            soft_candidate_timestamps,
-            frame_root / f"gap-{index:03d}",
-            maximum_frames=evidence_frames_per_gap,
-            max_edge=evidence_max_edge,
-        )
-        LOGGER.info(
-            "evidence gap=%d range=%.3f-%.3f frames=%s",
-            index,
-            gap.start,
-            gap.end,
-            json.dumps(
-                [
-                    {
-                        "timestamp": frame.timestamp,
-                        "shot_id": frame.shot_id,
-                        "scene_id": frame.scene_id,
-                        "salience": frame.salience,
-                        "role": frame.role,
-                    }
-                    for frame in frames
-                ],
-                sort_keys=True,
-            ),
-        )
-        if knowledge_store is not None:
-            knowledge_store.record_frames(index, frames)
-            context["knowledge"] = knowledge_store.query_gap_context(gap.start, gap.end)
-        try:
-            payload = backend.decide(
-                frames,
-                gap,
-                recent_transcript(gap, segments),
-                previous_ad,
-                context,
+    for index, gap in enumerate(gaps[:maximum_gaps], start=gap_index_offset + 1):
+        windows = split_evidence_windows(gap) if backend.uses_event_windows and not scene_fallback else [gap]
+        proposals: list[dict[str, Any]] = []
+        frames: list[EvidenceFrame] = []
+        gap_dir = frame_root / f"gap-{index:03d}"
+
+        def inspect_window(window: Gap, refine_description: str = "") -> dict[str, Any]:
+            window_index = len(proposals) + 1
+            context = context_for_gap(window, shots, scenes, soft_candidate_timestamps)
+            if defer_word_budget:
+                context["defer_word_budget"] = True
+            if scene_fallback:
+                context["scene_fallback"] = True
+            if refine_description:
+                context["refine_description"] = refine_description
+            evidence = sample_event_evidence_frames(
+                video_path,
+                window,
+                shots,
+                scenes,
+                soft_candidate_timestamps,
+                gap_dir / f"window-{window_index:03d}" if backend.uses_event_windows else gap_dir,
+                maximum_frames=evidence_frames_per_gap,
+                max_edge=evidence_max_edge,
+                coverage_first=backend.uses_event_windows,
             )
-        except Exception as exc:
-            payload = {
-                "decision": "WAIT",
-                "description": "",
-                "reason": f"visual backend failure: {type(exc).__name__}: {exc}",
-                "importance": 0.0,
-            }
-        payload = normalize_event_payload(payload, frames, gap)
-        decision_name = str(payload.get("decision", "WAIT")).upper()
-        if decision_name not in {"AD", "WAIT"}:
-            decision_name = "WAIT"
-        description = str(payload.get("description", "")).strip() if decision_name == "AD" else ""
-        description = limit_words(description, gap.word_budget) if description else ""
-        if decision_name == "AD" and not description:
-            decision_name = "WAIT"
-        if decision_name == "WAIT":
-            payload.update(
-                event_start=None,
-                event_end=None,
-                evidence_timestamps=[],
-                event_timing_source="none",
+            LOGGER.info(
+                "evidence gap=%d window=%d range=%.3f-%.3f timestamps=%s",
+                index, window_index, window.start, window.end,
+                [frame.timestamp for frame in evidence],
             )
-        decision = Decision(
-            gap_start=gap.start,
-            gap_end=gap.end,
-            decision=decision_name,
-            description=description,
-            reason=str(payload.get("reason", "")),
-            importance=float(payload.get("importance", 0.0)),
-            word_budget=gap.word_budget,
-            evidence_frames=[frame.path for frame in frames],
-            evidence_timestamps=[float(value) for value in payload.get("evidence_timestamps", [])],
-            event_start=_coerce_timestamp(payload.get("event_start")),
-            event_end=_coerce_timestamp(payload.get("event_end")),
-            event_timing_source=str(payload.get("event_timing_source", "none")),
-            preferred_cue_start=(
-                _coerce_timestamp(payload.get("event_start")) + 0.15
-                if _coerce_timestamp(payload.get("event_start")) is not None
-                else None
-            ),
-        )
-        decisions.append(decision)
-        LOGGER.info(
-            "ad_decision gap=%d decision=%s event_start=%s event_end=%s timing_source=%s "
-            "evidence_timestamps=%s importance=%.3f reason=%s",
-            index,
-            decision.decision,
-            decision.event_start,
-            decision.event_end,
-            decision.event_timing_source,
-            decision.evidence_timestamps,
-            decision.importance,
-            decision.reason.replace("\n", " "),
-        )
-        if knowledge_store is not None:
-            knowledge_store.record_decision(index, decision)
-        if decision.decision == "AD":
-            previous_ad.append(decision.description)
+            if knowledge_store is not None:
+                knowledge_store.record_frames(index, evidence)
+                context["knowledge"] = knowledge_store.query_gap_context(window.start, window.end)
+            try:
+                proposal = backend.decide(
+                    evidence, window, recent_transcript(window, segments), previous_ad, context
+                )
+            except Exception as exc:
+                proposal = {
+                    "decision": "WAIT",
+                    "reason": f"visual backend failure: {type(exc).__name__}: {exc}",
+                }
+            proposals.append({
+                "window_index": window_index,
+                "scan": "scene_fallback" if scene_fallback else "timing_followup" if refine_description else "initial",
+                "start": window.start,
+                "end": window.end,
+                "frames": [{"id": i, **asdict(frame)} for i, frame in enumerate(evidence, start=1)],
+                **proposal,
+            })
+            frames.extend(evidence)
+            return proposals[-1]
+
+        eligible = [item for item in map(inspect_window, windows) if item.get("decision") == "AD"]
+        reviews = []
+        if multi_event and backend.uses_event_windows:
+            eligible, reviews = refine_gap_events(
+                eligible, gap, backend, inspect_window, followup_budget, evidence_frames_per_gap
+            )
+            followup_budget -= sum(item["calls"] for item in reviews)
+        else:
+            eligible = eligible[:1]
+        if not eligible:
+            eligible = [proposals[0] if len(proposals) == 1 else {"decision": "WAIT", "reason": "no_eligible_event_in_gap"}]
+        for position, payload in enumerate(eligible):
+            decision = decision_from_proposal(
+                gap, payload, frames, index, backend.uses_event_windows, defer_word_budget=defer_word_budget,
+            )
+            if payload.get("decision") == "AD" and decision.decision == "WAIT":
+                payload["selection_reason"] = "no_usable_description"
+            if position == 0:
+                decision.visual_proposals = proposals
+                decision.visual_followups = reviews
+            decisions.append(decision)
+            LOGGER.info(
+                "ad_decision gap=%d window=%s decision=%s timing_source=%s ready_at=%s reason=%s",
+                index, decision.selected_window, decision.decision, decision.event_timing_source,
+                decision.description_ready_at, decision.reason,
+            )
+            if knowledge_store is not None and not scene_fallback:
+                knowledge_store.record_decision(len(decisions), decision)
+            if decision.decision == "AD":
+                previous_ad.append(decision.description)
     return decisions
+
+
+def record_ad_outcomes(
+    gap_audit: list[dict[str, Any]], decisions: Sequence[Decision], *, multi_event: bool,
+) -> list[dict[str, Any]]:
+    """Link each inspected window to its final cue or the stage that stopped it."""
+    groups: dict[int, dict[str, Any]] = {}
+    selected = {}
+    for index, item in enumerate(decisions, start=1):
+        if item.gap_index is None:
+            continue
+        if item.visual_proposals:
+            groups[item.gap_index] = {
+                "gap_index": item.gap_index, "gap_start": item.gap_start, "gap_end": item.gap_end,
+                "selected_window": item.selected_window, "selected_windows": [],
+                "windows": item.visual_proposals, "followups": item.visual_followups,
+            }
+        if item.selected_window is not None:
+            selected[item.gap_index, item.selected_window] = (index, item)
+            groups[item.gap_index]["selected_windows"].append(item.selected_window)
+
+    for gap in gap_audit:
+        if gap["gap_index"] is None:
+            continue
+        group = groups.get(gap["gap_index"])
+        if group is None:
+            gap.update(status="not_scanned", reason="gap_scan_limit")
+            continue
+        discarded = {}
+        for review in group["followups"]:
+            if review["kind"] == "duplicate_text":
+                discarded[review["discarded_window"]] = "duplicate_visual_event"
+            elif review["kind"] == "compare_events" and review["relation"] == "same":
+                discarded[review["windows"][1]] = "duplicate_visual_event"
+            elif review["kind"] == "earlier_support":
+                if review["used"]:
+                    discarded[review["source_window"]] = "replaced_by_earlier_evidence"
+                else:
+                    discarded[review["review_window"]] = "timing_followup_not_selected"
+
+        cue_count = 0
+        for window in group["windows"]:
+            window_index = window["window_index"]
+            outcome = {"status": "no_ad", "stage": "visual_review", "reason": window.get("reason") or "no_vlm_output"}
+            if outcome["reason"] in {"invalid_vlm_output", "empty_or_incomplete_caption"}:
+                replies = [window.get("raw_caption"), *(attempt.get("raw_output") for attempt in window.get("attempts", []))]
+                if not any(isinstance(reply, str) and reply.strip() for reply in replies):
+                    outcome["reason"] = "empty_vlm_output"
+            if window.get("decision") == "AD":
+                result = selected.get((gap["gap_index"], window_index))
+                if result is None:
+                    reason = "window_not_selected" if multi_event else "single_event_plan"
+                    outcome.update(stage="event_selection", reason=window.get("selection_reason") or discarded.get(window_index, reason))
+                else:
+                    index, item = result
+                    outcome["decision_index"] = index
+                    if item.decision == "AD" and item.tts_path:
+                        cue_count += 1
+                        outcome.update(status="ad_added", stage="placement", reason="cue_placed",
+                                       cue_start=item.cue_start, cue_end=item.cue_end)
+                        if item.fallback_scene_id is not None:
+                            outcome.update(
+                                reason=item.placement_method, scene_id=item.fallback_scene_id,
+                                overlaps_dialogue=item.overlaps_dialogue,
+                                dialogue_overlap_seconds=item.dialogue_overlap_seconds,
+                            )
+                    elif item.placement_method.startswith("rejected_"):
+                        outcome.update(stage="tts_and_placement", reason=item.reason)
+                    else:
+                        outcome.update(stage="ad_preparation", reason=item.reason or "ad_preparer_wait")
+                    if item.tts_attempts:
+                        outcome["tts_attempts"] = item.tts_attempts
+            window["outcome"] = outcome
+        flagged = any(window["outcome"].get("overlaps_dialogue") for window in group["windows"])
+        gap.update(status="ad_added" if cue_count else "no_ad", overlaps_dialogue=flagged,
+                   reason="cue_placed" if cue_count else "no_cue_from_windows",
+                   cue_count=cue_count)
+    return list(groups.values())
+
+
+def decision_from_proposal(
+    gap: Gap, proposal: dict[str, Any], frames: Sequence[EvidenceFrame], gap_index: int, grounded: bool,
+    *, defer_word_budget: bool = False,
+) -> Decision:
+    payload = proposal if grounded else normalize_event_payload(proposal, frames, gap)
+    description = ""
+    if str(payload.get("decision", "WAIT")).upper() == "AD":
+        description = direct_ad_text(str(payload.get("description", "")))
+        if not defer_word_budget:
+            description = limit_words(description, gap.word_budget)
+    is_ad = bool(description)
+    ready_at = _coerce_timestamp(payload.get("description_ready_at")) if is_ad else None
+    event_start = _coerce_timestamp(payload.get("event_start")) if is_ad else None
+    anchor = ready_at if ready_at is not None else event_start
+    return Decision(
+        gap_start=gap.start,
+        gap_end=gap.end,
+        decision="AD" if is_ad else "WAIT",
+        description=description,
+        reason=str(payload.get("reason", "")),
+        importance=float(payload.get("importance", 0.0)),
+        word_budget=gap.word_budget,
+        evidence_frames=(
+            [frame["path"] for frame in payload.get("frames", [])]
+            if is_ad and grounded else [frame.path for frame in frames]
+        ),
+        evidence_timestamps=list(payload.get("evidence_timestamps", [])) if is_ad else [],
+        event_start=event_start,
+        event_end=_coerce_timestamp(payload.get("event_end")) if is_ad else None,
+        event_timing_source=str(payload.get("event_timing_source", "none")) if is_ad else "none",
+        preferred_cue_start=anchor + 0.15 if anchor is not None else None,
+        description_ready_at=ready_at,
+        selected_window=payload.get("window_index") if is_ad else None,
+        gap_index=gap_index,
+    )
 
 
 def resolve_tts_backend(
@@ -1950,11 +2416,49 @@ def probe_duration(path: Path, ffprobe: str) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
+NARRATION_MARGIN = 0.075
+
+
+def uncovered_scenes(scenes: Sequence[Scene], decisions: Sequence[Decision]) -> list[Scene]:
+    """Cover a scene when it has a rendered cue grounded in that scene."""
+    anchors = []
+    for decision in decisions:
+        if decision.decision == "AD" and decision.tts_path:
+            anchor = decision.description_ready_at
+            if anchor is None:
+                anchor = decision.event_start if decision.event_start is not None else decision.cue_start
+            anchors.append(anchor)
+    return [scene for scene in scenes if not any(scene.start <= anchor < scene.end for anchor in anchors)]
+
+
+def scene_fallback_windows(scenes: Sequence[Scene]) -> list[Gap]:
+    """Sample the opening of each scene while reserving some room for speech at its end."""
+    return [
+        Gap(scene.start, min(scene.start + 12.0, scene.end - min(3.0, (scene.end - scene.start) / 3)),
+            min(12, max(2, math.floor((scene.end - scene.start) * 2.5))))
+        for scene in scenes
+    ]
+
+
+def earliest_narration_start(decision: Decision, safety_margin: float = NARRATION_MARGIN,
+                             maximum_anticipation: float = 0.35) -> float:
+    earliest = decision.gap_start + safety_margin
+    if decision.event_start is not None:
+        ready = decision.description_ready_at
+        earliest = max(earliest, ready if ready is not None else decision.event_start - maximum_anticipation)
+    return earliest
+
+
+def narration_seconds_after_anchor(decision: Decision) -> float:
+    return max(0.0, decision.gap_end - NARRATION_MARGIN - earliest_narration_start(decision))
+
+
 def choose_event_aware_cue_start(
     decision: Decision,
     narration_duration: float,
-    safety_margin: float = 0.075,
+    safety_margin: float = NARRATION_MARGIN,
     maximum_anticipation: float = 0.35,
+    occupied: Sequence[Interval] = (),
 ) -> tuple[float | None, str]:
     """Choose a safe cue near the visual event without narrating it too early."""
     earliest = decision.gap_start + safety_margin
@@ -1965,11 +2469,29 @@ def choose_event_aware_cue_start(
         centered = decision.gap_start + (decision.gap_end - decision.gap_start - narration_duration) / 2.0
         return min(max(centered, earliest), latest), "gap_center_fallback"
     preferred = decision.preferred_cue_start
+    ready_at = decision.description_ready_at
     if preferred is None:
-        preferred = decision.event_start + 0.15
-    cue_start = min(max(preferred, earliest), latest)
-    if cue_start < decision.event_start - maximum_anticipation:
+        preferred = (ready_at if ready_at is not None else decision.event_start) + 0.15
+    earliest = earliest_narration_start(decision, safety_margin, maximum_anticipation)
+    if latest < earliest:
         return None, "no_post_event_fit"
+    cue_start = min(max(preferred, earliest), latest)
+    if occupied:
+        # A second cue can move slightly to fit, while staying near its evidence.
+        latest = min(latest, preferred + 2.5)
+        candidates = []
+        for prior in sorted(occupied, key=lambda item: item.start):
+            end_before_prior = min(latest, prior.start - safety_margin - narration_duration)
+            if earliest <= end_before_prior:
+                candidates.append(min(max(preferred, earliest), end_before_prior))
+            earliest = max(earliest, prior.end + safety_margin)
+        if earliest <= latest:
+            candidates.append(min(max(preferred, earliest), latest))
+        if not candidates:
+            return None, "cue_conflict"
+        new_start = min(candidates, key=lambda start: (abs(start - preferred), start))
+        if not math.isclose(new_start, cue_start, abs_tol=0.001):
+            return new_start, "event_shifted_around_other_cue"
     if math.isclose(cue_start, preferred, abs_tol=0.001):
         method = "event_aligned"
     elif cue_start < preferred:
@@ -1977,6 +2499,46 @@ def choose_event_aware_cue_start(
     else:
         method = "event_shifted_later_for_gap_margin"
     return cue_start, method
+
+
+def choose_scene_fallback_start(
+    decision: Decision, duration: float, speech: Sequence[Interval], occupied: Sequence[Interval],
+) -> tuple[float | None, str, float]:
+    earliest = earliest_narration_start(decision)
+    latest = decision.gap_end - NARRATION_MARGIN - duration
+    if latest < earliest:
+        return None, "no_post_event_fit", 0.0
+    preferred = decision.preferred_cue_start if decision.preferred_cue_start is not None else earliest
+    latest = min(latest, max(earliest, preferred + 3.0))
+    preferred = min(latest, max(earliest, preferred))
+    speech = [item for item in speech if item.end > earliest and item.start < latest + duration]
+    blockers = [
+        Interval(item.start - NARRATION_MARGIN, item.end + NARRATION_MARGIN)
+        for item in occupied
+        if item.end + NARRATION_MARGIN > earliest and item.start - NARRATION_MARGIN < latest + duration
+    ]
+    # The overlap score is piecewise linear. Its minimum is at a speech boundary
+    # entering or leaving either end of the cue, or an allowed range endpoint.
+    edges = {earliest, latest, preferred}
+    for item in speech:
+        edges.update((item.start, item.end, item.start - duration, item.end - duration))
+    for item in blockers:
+        edges.update((item.start - duration, item.end))
+    best: tuple[float, float, float] | None = None
+    for start in edges:
+        end = start + duration
+        if not earliest <= start <= latest or any(
+            overlap(start, end, item.start, item.end) > 1e-6 for item in blockers
+        ):
+            continue
+        seconds = sum(overlap(start, end, item.start, item.end) for item in speech)
+        score = (round(seconds, 6), abs(start - preferred), start)
+        if best is None or score < best:
+            best = score
+    if best is None:
+        return None, "cue_conflict", 0.0
+    seconds, _, start = best
+    return start, "scene_fallback_overlap" if seconds > 0 else "scene_fallback_safe", seconds
 
 
 def synthesize_decisions(
@@ -1987,14 +2549,30 @@ def synthesize_decisions(
     transformers_model: str | None,
     device: str,
     ffprobe: str,
+    *,
+    rewrite_for_time: Callable[[int, str, float, float], str | None] | None = None,
+    decision_index_offset: int = 0,
+    fallback_speech: Sequence[Interval] = (),
+    existing_cues: Sequence[Decision] = (),
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
-    for index, decision in enumerate(decisions, start=1):
+    occupied_by_gap: dict[tuple[float, float], list[Interval]] = {}
+    priority = sorted(
+        enumerate(decisions, start=decision_index_offset + 1),
+        key=lambda item: (
+            item[1].gap_start, -item[1].importance,
+            item[1].preferred_cue_start if item[1].preferred_cue_start is not None else item[1].gap_start,
+        ),
+    )
+    globally_occupied = [Interval(item.cue_start, item.cue_end) for item in existing_cues
+                         if item.decision == "AD" and item.tts_path]
+    for index, decision in priority:
         if decision.decision != "AD":
             continue
         text = decision.description
-        available = max(0.25, decision.gap_end - decision.gap_start - 0.15)
+        occupied = occupied_by_gap.setdefault((decision.gap_start, decision.gap_end), [])
+        anchor_seconds = narration_seconds_after_anchor(decision)
         for attempt in range(4):
             audio_path = synthesize_text(
                 text,
@@ -2005,14 +2583,28 @@ def synthesize_decisions(
                 device,
             )
             duration = probe_duration(audio_path, ffprobe)
-            cue_start, placement_method = choose_event_aware_cue_start(decision, duration)
-            if duration <= available and cue_start is not None:
+            dialogue_overlap = 0.0
+            if decision.fallback_scene_id is not None:
+                cue_start, placement_method, dialogue_overlap = choose_scene_fallback_start(
+                    decision, duration, fallback_speech, globally_occupied,
+                )
+            else:
+                cue_start, placement_method = choose_event_aware_cue_start(decision, duration, occupied=occupied)
+            decision.tts_attempts.append({
+                "description": text, "duration_seconds": round(duration, 3),
+                "available_seconds": round(anchor_seconds, 3), "result": placement_method,
+            })
+            if cue_start is not None:
                 decision.description = text
                 decision.tts_path = str(audio_path)
                 decision.tts_duration = duration
                 decision.cue_start = cue_start
                 decision.cue_end = decision.cue_start + duration
                 decision.placement_method = placement_method
+                decision.overlaps_dialogue = dialogue_overlap > 0
+                decision.dialogue_overlap_seconds = dialogue_overlap
+                occupied.append(Interval(decision.cue_start, decision.cue_end))
+                globally_occupied.append(Interval(decision.cue_start, decision.cue_end))
                 LOGGER.info(
                     "ad_placement decision=%d gap=%.3f-%.3f event=%.3f-%.3f "
                     "cue=%.3f-%.3f method=%s tts_duration=%.3f",
@@ -2026,28 +2618,39 @@ def synthesize_decisions(
                     placement_method,
                     duration,
                 )
+                if decision.fallback_scene_id is not None:
+                    LOGGER.info("scene_fallback_ad scene=%d dialogue_overlap_seconds=%.3f",
+                                decision.fallback_scene_id, dialogue_overlap)
                 break
             words = text.split()
+            if decision.description_ready_at is not None:
+                if (attempt == 0 and rewrite_for_time is not None and duration > 0
+                        and placement_method in {"no_gap_fit", "no_post_event_fit"}):
+                    shorter = rewrite_for_time(index, text, anchor_seconds, duration)
+                    if shorter and len(shorter.split()) < len(words):
+                        text = shorter
+                        continue
+                break
             if len(words) <= 2:
                 break
-            event_available = available
-            if decision.event_start is not None:
-                event_available = max(
-                    0.25,
-                    decision.gap_end
-                    - 0.075
-                    - max(decision.gap_start + 0.075, decision.event_start - 0.35),
-                )
             target = max(
                 2,
-                math.floor(len(words) * min(available, event_available) / max(duration, 0.01) * 0.88),
+                math.floor(len(words) * anchor_seconds / max(duration, 0.01) * 0.88),
             )
             text = limit_words(text, max(2, min(target, len(words) - 1)))
         if not decision.tts_path:
             decision.decision = "WAIT"
-            decision.reason = "TTS could not fit a safe post-event slot after shortening"
+            decision.reason = {
+                "cue_conflict": "TTS conflicts with a higher-priority cue",
+                "no_gap_fit": "TTS narration is too long for the usable gap",
+                "no_post_event_fit": "TTS could not fit a safe post-event slot",
+            }.get(placement_method, "TTS could not fit a safe post-event slot")
+            if decision.fallback_scene_id is not None and placement_method == "no_post_event_fit":
+                decision.reason = "TTS could not finish inside the scene fallback window"
             decision.description = ""
-            decision.placement_method = "rejected_no_safe_event_slot"
+            decision.placement_method = (
+                "rejected_cue_conflict" if placement_method == "cue_conflict" else "rejected_no_safe_event_slot"
+            )
     return backend, decisions
 
 
@@ -2061,9 +2664,11 @@ def vtt_timestamp(seconds: float) -> str:
 
 def write_vtt(decisions: Sequence[Decision], output: Path) -> None:
     lines = ["WEBVTT", ""]
-    for decision in decisions:
+    for decision in sorted(decisions, key=lambda item: item.cue_start):
         if decision.decision != "AD" or not decision.tts_path:
             continue
+        if decision.overlaps_dialogue:
+            lines.extend([f"NOTE Dialogue overlap: {decision.dialogue_overlap_seconds:.3f} s", ""])
         lines.extend(
             [
                 f"{vtt_timestamp(decision.cue_start)} --> {vtt_timestamp(decision.cue_end)}",
@@ -2195,6 +2800,7 @@ def evaluate(
     elapsed: float,
 ) -> dict[str, Any]:
     active = [item for item in decisions if item.decision == "AD" and item.tts_path]
+    tts_candidates = sum(bool(item.tts_attempts or item.tts_path) for item in decisions)
     overlap_seconds = sum(
         overlap(item.cue_start, item.cue_end, interval.start, interval.end)
         for item in active
@@ -2205,30 +2811,52 @@ def evaluate(
         for item in active
         if item.event_start is not None
     ]
+    windows = [window for decision in decisions for window in decision.visual_proposals]
+    reviews = [review for decision in decisions for review in decision.visual_followups]
+    cue_counts: dict[tuple[float, float], int] = {}
+    for item in active:
+        key = (item.gap_start, item.gap_end)
+        cue_counts[key] = cue_counts.get(key, 0) + 1
     return {
         "duration_seconds": round(media.duration, 3),
         "shots": len(shots),
         "scenes": len(scenes),
         "candidate_gaps": len(gaps),
-        "processed_gaps": len(decisions),
+        "processed_gaps": sum(bool(item.visual_proposals) and item.fallback_scene_id is None for item in decisions),
         "accepted_ad_events": len(active),
+        "gaps_with_multiple_ad_events": sum(count > 1 for count in cue_counts.values()),
         "wait_events": sum(item.decision == "WAIT" for item in decisions),
         "event_grounded_ad_events": sum(item.event_start is not None for item in active),
+        "frame_id_grounded_ad_events": sum(item.event_timing_source == "model_frame_ids" for item in active),
+        "visual_windows_evaluated": sum(window["scan"] == "initial" for window in windows),
+        "first_pass_qwen_attempts": sum(
+            len(window.get("attempts", [])) for window in windows if window["scan"] == "initial"
+        ),
+        "followup_qwen_attempts": sum(review["calls"] for review in reviews),
+        "followup_elapsed_seconds": round(sum(review.get("elapsed_seconds", 0.0) for review in reviews), 3),
+        "duplicate_proposals_removed": sum(
+            review["kind"] == "duplicate_text" or review.get("relation") == "same"
+            for review in reviews
+        ),
+        "invalid_vlm_windows": sum(window["reason"] == "invalid_vlm_output" for window in windows),
+        "vlm_generation_failed_windows": sum(window["reason"] == "vlm_generation_failure" for window in windows),
+        "vlm_retried_windows": sum(len(window.get("attempts", [])) > 1 for window in windows),
         "event_aligned_ad_events": sum(
             item.placement_method.startswith("event_") for item in active
         ),
         "rejected_no_safe_event_slot": sum(
             item.placement_method == "rejected_no_safe_event_slot" for item in decisions
         ),
+        "rejected_cue_conflict": sum(item.placement_method == "rejected_cue_conflict" for item in decisions),
         "mean_cue_start_offset_from_event_seconds": (
             round(sum(event_offsets) / len(event_offsets), 4) if event_offsets else None
         ),
         "speech_overlap_seconds": round(overlap_seconds, 4),
-        "tts_fit_rate": round(
-            sum(item.tts_duration <= item.gap_end - item.gap_start for item in active) / len(active), 4
-        )
-        if active
-        else None,
+        "scene_fallback_windows": sum(window["scan"] == "scene_fallback" for window in windows),
+        "scene_fallback_cues": sum(item.fallback_scene_id is not None for item in active),
+        "scene_fallback_overlap_cues": sum(item.overlaps_dialogue for item in active),
+        "tts_candidates": tts_candidates,
+        "tts_fit_rate": round(len(active) / tts_candidates, 4) if tts_candidates else None,
         "processing_seconds": round(elapsed, 3),
         "real_time_factor": round(elapsed / media.duration, 4),
     }
@@ -2237,7 +2865,11 @@ def evaluate(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output-video", type=Path, required=True)
+    parser.add_argument("--output-video", type=Path, help="Described MP4 (required for AD generation)")
+    dialogue = parser.add_mutually_exclusive_group()
+    dialogue.add_argument("--dialogue-only", action="store_true", help="Export dialogue-result.json and the analysis WAV")
+    dialogue.add_argument("--dialogue-input", type=Path, help="Resume AD generation from a saved dialogue result")
+    parser.add_argument("--analysis-audio", type=Path, help="Reuse the dialogue worker's analysis WAV")
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument(
@@ -2252,8 +2884,16 @@ def parse_args() -> argparse.Namespace:
         help="Local Whisper model directory; model downloading is disabled by default",
     )
     parser.add_argument("--allow-model-download", action="store_true", help="Disabled by default for offline runs")
-    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25"], default="heuristic")
-    parser.add_argument("--vlm-model", help="Local Qwen2.5-VL model directory")
+    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25", "qwen3vl", "qwen3vl8b", "smolvlm"], default="heuristic")
+    parser.add_argument("--smolvlm-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
+                        help="Maximum generated tokens per SmolVLM frame")
+    parser.add_argument("--vlm-model", help="Local VLM model directory or Qwen3-VL GGUF")
+    parser.add_argument("--vlm-mmproj", type=Path, help="Local Qwen3-VL vision projector GGUF")
+    parser.add_argument("--vlm-executable", default="llama-mtmd-cli", help="Local Qwen3-VL CPU executable")
+    parser.add_argument("--ad-preparer-model", type=Path, help="Optional local Qwen3-1.7B GGUF for cue editing")
+    parser.add_argument("--ad-preparer-executable", default="llama-completion", help="Path to llama-completion")
+    parser.add_argument("--ad-preparer-reasoning-tokens", type=int,
+                        help=f"CPU thinking budget when the editor is enabled (default: {DEFAULT_REASONING_TOKENS}; 0 disables it)")
     parser.add_argument(
         "--tts-backend",
         choices=["auto", "transformers", "piper", "espeak-ng", "say"],
@@ -2263,6 +2903,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
     parser.add_argument("--maximum-gaps", type=int, default=12)
+    parser.add_argument("--scene-fallback", action=argparse.BooleanOptionalAction, default=True,
+                        help="Describe uncovered scenes and flag any dialogue overlap")
+    parser.add_argument("--ad-plan", choices=["single", "multi"], default="multi",
+                        help="Choose one proposal or schedule multiple events per speech gap")
+    parser.add_argument("--event-followups", type=int, default=2,
+                        help="Maximum extra Qwen calls per video for multi-event refinement")
+    parser.add_argument("--qwen-seconds-per-call", type=float,
+                        help="Optional measured per-call time for a planning estimate")
     parser.add_argument(
         "--dialogue-filter",
         choices=["timestamp", "none"],
@@ -2283,22 +2931,154 @@ def parse_args() -> argparse.Namespace:
         "--evidence-frames",
         type=int,
         default=6,
-        help="Maximum event-selected frames supplied to the VLM for each gap",
+        help="Maximum event-selected frames supplied per visual window",
     )
     parser.add_argument("--shot-threshold", type=float, default=27.0)
     parser.add_argument("--scene-threshold", type=float, default=0.52)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.dialogue_only and args.output_video is None:
+        parser.error("--output-video is required for AD generation")
+    if args.analysis_audio and not args.dialogue_input:
+        parser.error("--analysis-audio requires --dialogue-input")
+    return args
+
+
+def analyze_dialogue(
+    args: argparse.Namespace, media: MediaInfo, analysis_wav: Path,
+    device: str, profiler: RuntimeProfiler,
+) -> dict:
+    """Run the same dialogue analysis for standalone and combined jobs."""
+    with profiler.stage("audio_silence_check", method="pcm_exact_zero", compute_device="cpu") as stage:
+        silent_audio = analysis_audio_is_silent(analysis_wav)
+        stage.update(silent=silent_audio)
+    with profiler.stage(
+        "asr", requested_method=args.asr_backend, compute_device="cpu" if silent_audio else device,
+    ) as stage:
+        if silent_audio:
+            raw_segments, raw_words = [], []
+            asr_report = {
+                "backend": "silence_skip",
+                "model": args.asr_model,
+                "device": "cpu",
+                "skipped": True,
+                "skip_reason": "silent_pcm",
+                "segments": 0,
+                "words": 0,
+            }
+            stage.update(skip_reason=asr_report["skip_reason"])
+            LOGGER.info("method stage=asr backend=silence_skip device=cpu reason=silent_pcm")
+        else:
+            raw_segments, raw_words, asr_report = transcribe_audio(
+                analysis_wav,
+                args.asr_model,
+                device,
+                args.allow_model_download,
+                args.asr_backend,
+            )
+        stage.update(
+            method=asr_report["backend"],
+            model=asr_report["model"],
+            skipped=silent_audio,
+            segments=len(raw_segments),
+            words=len(raw_words),
+        )
+    if args.dialogue_filter == "timestamp":
+        with profiler.stage(
+            "dialogue_timestamp_validation",
+            method="whisper_word_duration_validation",
+            compute_device="cpu",
+        ) as stage:
+            words, dialogue_validation_report = validate_whisper_word_timestamps(
+                raw_words,
+                maximum_duration=args.maximum_word_duration,
+            )
+            segments = _segments_from_words(words)
+            stage.update(**dialogue_validation_report)
+    else:
+        dialogue_validation_report = {
+            "method": "none",
+            "raw_words": len(raw_words),
+            "validated_words": len(raw_words),
+            "rejected_words": 0,
+        }
+        words = list(raw_words)
+        segments = list(raw_segments)
+        LOGGER.warning(
+            "fallback stage=dialogue_timestamp_validation backend=none "
+            "reason=unvalidated_whisper_word_timestamps_requested"
+        )
+    with profiler.stage(
+        "speech_gap_detection",
+        method="validated_word_intervals_padding_merge",
+        compute_device="cpu",
+    ) as stage:
+        speech = speech_intervals_from_words(words, media.duration)
+        gap_audit: list[dict[str, Any]] = []
+        gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap, audit=gap_audit)
+        stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
+    return {
+        "schema_version": 1,
+        "media": asdict(media),
+        "transcript": {
+            "report": {
+                **asr_report,
+                "raw_segments": len(raw_segments),
+                "raw_words": len(raw_words),
+                "validated_segments": len(segments),
+                "validated_words": len(words),
+            },
+            "segments": [asdict(row) for row in segments],
+            "words": [asdict(row) for row in words],
+            "raw_segments": [asdict(row) for row in raw_segments],
+            "raw_words": [asdict(row) for row in raw_words],
+        },
+        "dialogue_validation": dialogue_validation_report,
+        "speech_and_gaps": {
+            "speech": [asdict(row) for row in speech],
+            "gaps": [asdict(row) for row in gaps],
+            "gap_audit": gap_audit,
+        },
+    }
+
+
+def write_dialogue_artifacts(work_dir: Path, dialogue: dict) -> None:
+    write_json(work_dir / "media.json", dialogue["media"])
+    write_json(work_dir / "transcript.json", dialogue["transcript"])
+    write_json(work_dir / "dialogue-validation.json", dialogue["dialogue_validation"])
+    write_json(work_dir / "speech-and-gaps.json", dialogue["speech_and_gaps"])
 
 
 def main() -> None:
     args = parse_args()
+    if args.smolvlm_max_new_tokens < 1:
+        raise ValueError("--smolvlm-max-new-tokens must be positive")
+    if args.ad_preparer_reasoning_tokens is None:
+        args.ad_preparer_reasoning_tokens = DEFAULT_REASONING_TOKENS if args.ad_preparer_model else 0
+    if not 0 <= args.ad_preparer_reasoning_tokens <= 512:
+        raise ValueError("--ad-preparer-reasoning-tokens must be between 0 and 512")
+    if args.ad_preparer_reasoning_tokens and not args.ad_preparer_model:
+        raise ValueError("--ad-preparer-reasoning-tokens requires --ad-preparer-model")
+    generate_cue = None
+    if args.ad_preparer_model:
+        model_path = args.ad_preparer_model.resolve()
+        executable = shutil.which(args.ad_preparer_executable)
+        if not model_path.is_file() or not executable:
+            raise ValueError("AD preparation requires a local GGUF file and an executable llama-completion")
+        generate_cue = lambda llm_input: run_qwen_cue(executable, model_path, llm_input)
     if args.evidence_max_edge < 0:
         raise ValueError("--evidence-max-edge must be zero or a positive integer")
-    if args.evidence_frames < 3:
-        raise ValueError("--evidence-frames must be at least 3")
+    minimum_evidence_frames = 2 if args.visual_backend == "qwen3vl" else 3
+    if args.evidence_frames < minimum_evidence_frames:
+        raise ValueError(f"--evidence-frames must be at least {minimum_evidence_frames}")
+    if args.event_followups < 0:
+        raise ValueError("--event-followups must be zero or a positive integer")
+    if args.qwen_seconds_per_call is not None and (
+        not math.isfinite(args.qwen_seconds_per_call) or args.qwen_seconds_per_call <= 0
+    ):
+        raise ValueError("--qwen-seconds-per-call must be finite and positive")
     started = time.perf_counter()
     input_video = args.input.resolve()
-    output_video = args.output_video.resolve()
+    output_video = args.output_video.resolve() if args.output_video else None
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(work_dir)
@@ -2337,60 +3117,37 @@ def main() -> None:
     with profiler.stage("hardware_probe", method="python_platform_and_torch", compute_device="cpu"):
         profiler.set_hardware(collect_hardware_info())
 
-    analysis_wav = work_dir / "analysis-audio.wav"
-    with profiler.stage(
-        "audio_extraction",
-        method="ffmpeg_pcm_s16le_16khz_mono",
-        compute_device="cpu",
-    ):
-        extract_analysis_audio(input_video, analysis_wav, ffmpeg)
-    with profiler.stage("asr", requested_method=args.asr_backend, compute_device=device) as stage:
-        raw_segments, raw_words, asr_report = transcribe_audio(
-            analysis_wav,
-            args.asr_model,
-            device,
-            args.allow_model_download,
-            args.asr_backend,
-        )
-        stage.update(
-            method=asr_report["backend"],
-            model=asr_report["model"],
-            segments=len(raw_segments),
-            words=len(raw_words),
-        )
-    if args.dialogue_filter == "timestamp":
+    analysis_wav = args.analysis_audio.resolve() if args.analysis_audio else work_dir / "analysis-audio.wav"
+    if not args.analysis_audio:
         with profiler.stage(
-            "dialogue_timestamp_validation",
-            method="whisper_word_duration_validation",
+            "audio_extraction",
+            method="ffmpeg_pcm_s16le_16khz_mono",
             compute_device="cpu",
-        ) as stage:
-            words, dialogue_validation_report = validate_whisper_word_timestamps(
-                raw_words,
-                maximum_duration=args.maximum_word_duration,
-            )
-            segments = _segments_from_words(words)
-            stage.update(**dialogue_validation_report)
+        ):
+            extract_analysis_audio(input_video, analysis_wav, ffmpeg)
+    elif not analysis_wav.is_file():
+        raise FileNotFoundError(analysis_wav)
+
+    if args.dialogue_input:
+        with profiler.stage("dialogue_import", method="saved_dialogue_result", compute_device="cpu") as stage:
+            dialogue = json.loads(args.dialogue_input.read_text(encoding="utf-8"))
+            if dialogue.get("schema_version") != 1 or dialogue.get("media") != asdict(media):
+                raise ValueError("Dialogue result version or media metadata does not match the input video")
+            stage.update(candidate_gaps=len(dialogue["speech_and_gaps"]["gaps"]))
     else:
-        dialogue_validation_report = {
-            "method": "none",
-            "raw_words": len(raw_words),
-            "validated_words": len(raw_words),
-            "rejected_words": 0,
-        }
-        words = list(raw_words)
-        segments = list(raw_segments)
-        LOGGER.warning(
-            "fallback stage=dialogue_timestamp_validation backend=none "
-            "reason=unvalidated_whisper_word_timestamps_requested"
-        )
-    with profiler.stage(
-        "speech_gap_detection",
-        method="validated_word_intervals_padding_merge",
-        compute_device="cpu",
-    ) as stage:
-        speech = speech_intervals_from_words(words, media.duration)
-        gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap)
-        stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
+        dialogue = analyze_dialogue(args, media, analysis_wav, device, profiler)
+
+    if args.dialogue_only:
+        write_json(work_dir / "dialogue-result.json", dialogue)
+        write_dialogue_artifacts(work_dir, dialogue)
+        profiler.finalize()
+        return
+
+    segments = [TranscriptSegment(**row) for row in dialogue["transcript"]["segments"]]
+    words = [Word(**row) for row in dialogue["transcript"]["words"]]
+    speech = [Interval(**row) for row in dialogue["speech_and_gaps"]["speech"]]
+    gaps = [Gap(**row) for row in dialogue["speech_and_gaps"]["gaps"]]
+    gap_audit = dialogue["speech_and_gaps"]["gap_audit"]
 
     with profiler.stage("shot_detection", compute_device="cpu") as stage:
         shots = detect_shots(
@@ -2418,6 +3175,7 @@ def main() -> None:
             validation_passed=shot_validation["validation_passed"],
             warnings=len(shot_validation["warnings"]),
             soft_candidates=shot_validation["soft_candidate_count"],
+            near_blank_intervals=len(shot_validation["near_blank_intervals"]),
         )
     with profiler.stage(
         "shot_visual_features",
@@ -2472,21 +3230,39 @@ def main() -> None:
             soft_candidates=len(soft_candidate_timestamps),
         )
 
-    visual_compute_device = device if args.visual_backend == "qwen25" else "cpu"
+    qwen_plan = None
+    qwen_event_backend = args.visual_backend in {"qwen25", "qwen3vl", "qwen3vl8b"}
+    if qwen_event_backend:
+        qwen_plan = plan_qwen_calls(
+            gaps, args.maximum_gaps, args.event_followups if args.ad_plan == "multi" else 0,
+            args.qwen_seconds_per_call,
+        )
+        LOGGER.info("qwen_call_plan %s", json.dumps(qwen_plan))
+    visual_compute_device = device if args.visual_backend in {"qwen25", "qwen3vl8b", "smolvlm"} else "cpu"
+    followup_budget = args.event_followups if qwen_event_backend else 0
+    defer_word_budget = qwen_event_backend and generate_cue is not None
     with profiler.stage(
         "visual_backend_initialization",
         method=args.visual_backend,
         compute_device=visual_compute_device,
+        model=args.vlm_model,
     ):
-        backend = choose_backend(args.visual_backend, args.vlm_model, device)
+        backend = choose_backend(
+            args.visual_backend, args.vlm_model, device, smolvlm_max_new_tokens=args.smolvlm_max_new_tokens,
+            vlm_mmproj=args.vlm_mmproj, vlm_executable=args.vlm_executable,
+        )
     with profiler.stage(
         "ad_decisions",
         method=args.visual_backend,
         compute_device=visual_compute_device,
         evidence_max_edge=args.evidence_max_edge or "source",
-        evidence_frames_per_gap=args.evidence_frames,
-        evidence_sampling="adaptive_visual_change_and_boundaries",
+        evidence_frames_per_window=args.evidence_frames,
+        ad_plan=args.ad_plan,
+        event_followup_budget=followup_budget if args.ad_plan == "multi" else 0,
+        evidence_sampling="temporal_windows" if backend.uses_event_windows else "adaptive_visual_change_and_boundaries",
     ) as stage:
+        if qwen_event_backend:
+            stage["word_budget_stage"] = "ad_preparation" if defer_word_budget else "visual_review"
         decisions = make_decisions(
             input_video,
             gaps,
@@ -2500,13 +3276,43 @@ def main() -> None:
             args.evidence_frames,
             soft_candidate_timestamps,
             knowledge_store,
+            multi_event=args.ad_plan == "multi",
+            followup_budget=followup_budget,
+            defer_word_budget=defer_word_budget,
         )
         stage.update(
-            processed_gaps=len(decisions),
+            processed_gaps=sum(bool(item.visual_proposals) for item in decisions),
+            followup_qwen_attempts=sum(
+                review["calls"] for item in decisions for review in item.visual_followups
+            ),
             ad_decisions=sum(item.decision == "AD" for item in decisions),
             wait_decisions=sum(item.decision == "WAIT" for item in decisions),
             **backend.runtime_metrics(),
         )
+    with profiler.stage(
+        "ad_preparation", compute_device="cpu",
+        method="qwen3_llama_cpp" if generate_cue else "incomplete_description_validation",
+    ) as stage:
+        def build_cue_input(context: dict) -> dict:
+            return build_qwen_cue_input(context, reasoning_tokens=args.ad_preparer_reasoning_tokens)
+
+        prepared = prepare_ad_cues(
+            decisions, shots, words, generate_cue, scenes=scenes,
+            build_input=build_cue_input, narration_seconds=narration_seconds_after_anchor,
+        )
+        write_json(work_dir / "ad-preparation.json", prepared)
+        counts = {status: sum(row["status"] == status for row in prepared)
+                  for status in ("prepared", "fallback", "wait")}
+        counts["contextual_identifications"] = sum(bool(row["dialogue_reference"]) for row in prepared)
+        stage.update(reasoning_tokens=args.ad_preparer_reasoning_tokens, **counts)
+        LOGGER.info("ad_preparation model=%s results=%s", args.ad_preparer_model, counts)
+    prepared_by_index = {row["decision_index"]: row for row in prepared}
+
+    def rewrite_for_time(index: int, text: str, seconds: float, measured: float) -> str | None:
+        if generate_cue is None or index not in prepared_by_index:
+            return None
+        return retry_prepared_cue(prepared_by_index[index], text, seconds, measured, generate_cue, build_cue_input)
+
     tts_compute_device = (
         device
         if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
@@ -2525,6 +3331,7 @@ def main() -> None:
             args.tts_model,
             device,
             ffprobe,
+            rewrite_for_time=rewrite_for_time if generate_cue else None,
         )
         stage.update(
             method=tts_backend,
@@ -2533,7 +3340,58 @@ def main() -> None:
             event_aligned_cues=sum(
                 item.placement_method.startswith("event_") for item in decisions if item.tts_path
             ),
+            cue_rewrite_attempts=sum("timing_retry" in row for row in prepared),
+            cue_rewrite_elapsed_seconds=round(sum(
+                row.get("timing_retry", {}).get("elapsed_seconds", 0) for row in prepared
+            ), 6),
         )
+
+    missing_scenes = uncovered_scenes(scenes, decisions) if args.scene_fallback else []
+    if qwen_plan is not None:
+        qwen_plan["max_scene_fallback_calls"] = 2 * len(missing_scenes)
+    if missing_scenes:
+        fallback_windows = scene_fallback_windows(missing_scenes)
+        with profiler.stage(
+            "scene_fallback_visual", method=args.visual_backend, compute_device=visual_compute_device,
+        ) as stage:
+            fallback = make_decisions(
+                input_video, fallback_windows, shots, scenes, segments, backend,
+                work_dir / "evidence-frames", len(fallback_windows),
+                args.evidence_max_edge or None, args.evidence_frames, soft_candidate_timestamps, knowledge_store,
+                defer_word_budget=defer_word_budget, gap_index_offset=len(gaps), scene_fallback=True,
+            )
+            stage["uncovered_scenes"] = len(missing_scenes)
+        for scene, window, item in zip(missing_scenes, fallback_windows, fallback, strict=True):
+            item.fallback_scene_id = scene.scene_id
+            item.gap_end = min(scene.end, window.end + 4.0)
+            gap_audit.append({
+                "kind": "scene_fallback", "scene_id": scene.scene_id, "gap_index": item.gap_index,
+                "start": item.gap_start, "end": item.gap_end, "status": "eligible",
+            })
+        offset = len(decisions)
+        with profiler.stage("scene_fallback_preparation", method="ad_preparation", compute_device="cpu"):
+            extra_prepared = prepare_ad_cues(
+                fallback, shots, words, generate_cue, scenes=scenes, build_input=build_cue_input,
+                narration_seconds=narration_seconds_after_anchor, decision_index_offset=offset,
+            )
+            prepared.extend(extra_prepared)
+            prepared_by_index.update((row["decision_index"], row) for row in extra_prepared)
+        with profiler.stage("scene_fallback_tts", method=tts_backend, compute_device=tts_compute_device) as stage:
+            synthesize_decisions(
+                fallback, work_dir / "narration", args.tts_backend, args.piper_model, args.tts_model, device, ffprobe,
+                rewrite_for_time=rewrite_for_time if generate_cue else None, decision_index_offset=offset,
+                fallback_speech=speech, existing_cues=decisions,
+            )
+            stage.update(
+                generated_cues=sum(bool(item.tts_path) for item in fallback),
+                dialogue_overlap_cues=sum(item.overlaps_dialogue for item in fallback),
+                compute_device=device if tts_backend == "transformers" else "cpu",
+            )
+        decisions.extend(fallback)
+
+    with profiler.stage("visual_proposal_write", method="json", compute_device="cpu"):
+        proposals = record_ad_outcomes(gap_audit, decisions, multi_event=args.ad_plan == "multi")
+        write_json(work_dir / "ad-proposals.json", proposals)
 
     with profiler.stage(
         "knowledge_finalize",
@@ -2545,33 +3403,16 @@ def main() -> None:
         knowledge_store.close()
 
     with profiler.stage("artifact_write", method="json_and_webvtt", compute_device="cpu"):
+        write_json(work_dir / "ad-preparation.json", prepared)
         write_vtt(decisions, work_dir / "descriptions.vtt")
-        write_json(work_dir / "media.json", asdict(media))
-        write_json(
-            work_dir / "transcript.json",
-            {
-                "report": {
-                    **asr_report,
-                    "raw_segments": len(raw_segments),
-                    "raw_words": len(raw_words),
-                    "validated_segments": len(segments),
-                    "validated_words": len(words),
-                },
-                "segments": [asdict(x) for x in segments],
-                "words": [asdict(x) for x in words],
-                "raw_segments": [asdict(x) for x in raw_segments],
-                "raw_words": [asdict(x) for x in raw_words],
-            },
-        )
-        write_json(work_dir / "dialogue-validation.json", dialogue_validation_report)
-        write_json(
-            work_dir / "speech-and-gaps.json",
-            {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps]},
-        )
+        write_dialogue_artifacts(work_dir, dialogue)
         write_json(work_dir / "shots.json", [asdict(x) for x in shots])
         write_json(work_dir / "shot-boundary-validation.json", shot_validation)
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])
-        write_json(work_dir / "ad-decisions.json", [asdict(x) for x in decisions])
+        write_json(work_dir / "ad-decisions.json", [
+            {key: value for key, value in vars(item).items() if key not in {"visual_proposals", "visual_followups"}}
+            for item in decisions
+        ])
 
     with profiler.stage("video_mix", compute_device="cpu") as stage:
         stage["method"] = mix_described_video(input_video, output_video, decisions, ffmpeg)
@@ -2584,7 +3425,9 @@ def main() -> None:
             "output": str(output_video),
             "device": device,
             "visual_backend": args.visual_backend,
+            "qwen_call_plan": qwen_plan,
             "tts_backend": tts_backend,
+            "scene_fallback": args.scene_fallback,
             "offline": not args.allow_model_download,
             "runtime_log": str(work_dir / "runtime.log"),
             "runtime_events": str(profiler.events_path),
