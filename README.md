@@ -37,15 +37,63 @@ staged models offline. Compose stores uploads, job state, and results in
 the local `job-data` volume. `docker compose stop` stops the services and
 keeps the volume.
 
-## How it works
+## How the containers interact
 
-1. **Studio** uploads the source once, queues the job, and streams review
-   media to the browser.
-2. **Whisper** transcribes audio and writes dialogue timing and candidate
-   gaps to SQLite.
-3. **AD Maker** reviews timestamped video frames with recent dialogue,
-   places short descriptions, synthesizes narration with MMS-TTS, and
-   renders a selectable AD track.
+The browser talks to `studio` over HTTP. All three containers mount
+`job-data` at `/data`. SQLite in that volume holds the job queue and
+dialogue records. The original video, analysis WAV, and finished artifacts
+are files on the same volume. Both workers load checkpoints from the
+read-only `/models` mount.
+
+```mermaid
+sequenceDiagram
+    actor Browser
+    participant Studio as studio
+    participant DB as SQLite
+    participant Files as Files on job-data
+    participant Whisper as whisper
+    participant AD as ad-maker
+
+    Browser->>Studio: POST /api/media with MP4 bytes
+    Studio->>Files: Save source.mp4
+    Studio->>DB: Register media_id and source path
+    Studio-->>Browser: Media ID and audio track metadata
+
+    Browser->>Studio: POST /api/media/{media_id}/generate with device preference
+    Studio->>DB: Enqueue the Whisper stage with media_id and device preference
+    Studio-->>Browser: HTTP 202 with job_id and queued state
+
+    Whisper->>DB: Claim a Whisper job and look up its source
+    DB-->>Whisper: Job ID, source path, and selected device
+    Files-->>Whisper: Original MP4
+    Whisper->>Files: Save 16 kHz mono analysis-audio.wav
+    Whisper->>DB: Save timestamped dialogue and gaps, then queue AD
+
+    AD->>DB: Claim an AD job and load its Whisper result
+    DB-->>AD: Source path, analysis WAV path, dialogue, gaps, and device
+    Files-->>AD: Original MP4 and analysis WAV
+    AD->>Files: Save described MP4, WebVTT, narration plan, and cue WAVs
+    AD->>DB: Mark the job finished and record the result directory
+
+    Browser->>Studio: GET /api/jobs/{job_id}
+    Studio->>DB: Read job state and result directory
+    Studio-->>Browser: Stage and worker devices, plus file URLs once finished
+    Browser->>Studio: GET /result/{job_id}/... with an optional Range header
+    Studio->>Files: Read the requested file or byte range
+    Studio-->>Browser: File bytes, with HTTP 206 for a requested range
+```
+
+- **Studio** saves the uploaded MP4 once. The browser polls the job endpoint
+  during processing and can request the transcript and gaps at
+  `GET /api/jobs/{job_id}/dialogue` as soon as Whisper publishes them.
+- **Whisper** extracts the analysis audio and transcribes it. Saving the
+  dialogue and queuing AD happens in one transaction, so AD Maker picks up
+  the job with its input ready.
+- **AD Maker** combines the original frames with the saved dialogue and gaps.
+  It plans cues, runs the available cue editor and MMS-TTS, then mixes the
+  narration into a selectable track. It publishes the result directory
+  after writing the files. Studio serves MP4s and cue WAVs by byte range
+  when the browser requests partial content.
 
 Click a VLM marker to inspect the saved prompt, selected frames, and reply.
 The timeline also shows shots, scenes, dialogue, and placed cues. Review the
