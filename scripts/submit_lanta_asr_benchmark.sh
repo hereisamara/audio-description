@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1
 #SBATCH -t 04:00:00
-#SBATCH -A lt200246
 #SBATCH -J asr-compare
 #SBATCH --output=asr_compare.%j.out
 #SBATCH --error=asr_compare.%j.err
@@ -26,7 +25,7 @@ input_video=$1
 input_name=$(basename "$input_video")
 input_stem=${input_name%.*}
 output_dir=${2:-"$repo_dir/outputs/asr-comparison-$input_stem"}
-reference=${ASR_REFERENCE:-"$repo_dir/references/real-scene-01-dialogue.json"}
+reference=${ASR_REFERENCE:?Set ASR_REFERENCE to your reference dialogue JSON file}
 
 default_models="whisper-small=$repo_dir/models/whisper-small.en-transformers;whisper-turbo=$repo_dir/models/whisper-large-v3-turbo;distil-whisper=$repo_dir/models/distil-large-v3;wav2vec2-large=$repo_dir/models/wav2vec2-large-960h-lv60-self"
 IFS=';' read -r -a model_specs <<< "${ASR_MODELS:-$default_models}"

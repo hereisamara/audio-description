@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-task=1
 #SBATCH -t 24:00:00
-#SBATCH -A lt200246
 #SBATCH -J audio-ad-poc
 #SBATCH --output=audio_ad.%j.out
 #SBATCH --error=audio_ad.%j.err
@@ -45,14 +44,20 @@ else
 fi
 
 asr_model=${ASR_MODEL:-"$model_root/whisper-small.en-transformers"}
-vlm_model=${VLM_MODEL:-"$model_root/Qwen2.5-VL-3B-Instruct"}
+vlm_backend=${VLM_BACKEND:-qwen3vl8b}
+case "$vlm_backend" in
+  qwen3vl8b) default_vlm=Qwen3-VL-8B-Instruct ;;
+  qwen25) default_vlm=Qwen2.5-VL-3B-Instruct ;;
+  *) echo "VLM_BACKEND must be qwen3vl8b or qwen25." >&2; exit 2 ;;
+esac
+vlm_model=${VLM_MODEL:-"$model_root/$default_vlm"}
 tts_model=${TTS_MODEL:-"$model_root/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
 evidence_frames=${EVIDENCE_FRAMES:-6}
 evidence_max_edge=${EVIDENCE_MAX_EDGE:-0}
 ad_plan=${AD_PLAN:-multi}
 event_followups=${EVENT_FOLLOWUPS:-2}
-ad_preparer=${AD_PREPARER:-0}
+ad_preparer=${AD_PREPARER:-auto}
 set --
 if [[ ${SCENE_FALLBACK:-1} == 0 ]]; then
   set -- --no-scene-fallback
@@ -69,22 +74,34 @@ for required_path in "$input_video" "$asr_model" "$vlm_model" "$tts_model"; do
 done
 
 module load Mamba/23.11.0-0
+default_preparer="$model_root/Qwen3-1.7B-Q4_K_M.gguf"
+if [[ -s "$model_root/cpu-llm/Qwen3-1.7B-Q4_K_M.gguf" ]]; then
+  default_preparer="$model_root/cpu-llm/Qwen3-1.7B-Q4_K_M.gguf"
+fi
+preparer_model=${AD_PREPARER_MODEL:-"$default_preparer"}
+preparer_executable=${AD_PREPARER_EXECUTABLE:-"$submit_dir/outputs/lanta-ad-preparer/bin/llama-completion"}
+if [[ $ad_preparer == auto ]]; then
+  if [[ -s "$preparer_model" && -x "$preparer_executable" ]]; then
+    ad_preparer=1
+  else
+    ad_preparer=0
+  fi
+fi
 case $ad_preparer in
   0) ;;
   1)
-    preparer_model=${AD_PREPARER_MODEL:-"$model_root/Qwen3-1.7B-Q4_K_M.gguf"}
-    preparer_executable=${AD_PREPARER_EXECUTABLE:-"$submit_dir/outputs/lanta-ad-preparer/bin/llama-completion"}
-    if [[ ! -s $preparer_model || ! -x $preparer_executable ]]; then
+    if [[ ! -s "$preparer_model" || ! -x "$preparer_executable" ]]; then
       printf 'Missing AD preparer checkpoint or executable:\n  %s\n  %s\n' "$preparer_model" "$preparer_executable" >&2
       exit 1
     fi
     conda run --no-capture-output -n "$conda_env" "$preparer_executable" --version
-    set -- "$@" --ad-preparer-model "$preparer_model" \
-      --ad-preparer-executable "$preparer_executable" \
-      --ad-preparer-reasoning-tokens "${AD_PREPARER_REASONING_TOKENS:-0}"
+    set -- "$@" --ad-preparer-model "$preparer_model" --ad-preparer-executable "$preparer_executable"
+    if [[ -n ${AD_PREPARER_REASONING_TOKENS:-} ]]; then
+      set -- "$@" --ad-preparer-reasoning-tokens "$AD_PREPARER_REASONING_TOKENS"
+    fi
     ;;
   *)
-    echo "AD_PREPARER must be 0 or 1." >&2
+    echo "AD_PREPARER must be auto, 0, or 1." >&2
     exit 2
     ;;
 esac
@@ -111,8 +128,9 @@ echo "Repository: $repo_dir"
 echo "Conda environment: $conda_env"
 echo "Input: $input_video"
 echo "Output: $output_video"
+echo "Visual model: $vlm_backend ($vlm_model)"
 echo "Visual evidence: $evidence_frames frames per window, max edge $evidence_max_edge (0 = source)"
-echo "AD preparer: $ad_preparer (1 = Qwen3 on CPU)"
+echo "AD preparer: $ad_preparer (1 = Qwen3-1.7B on CPU)"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not-set}"
 nvidia-smi
 
@@ -127,7 +145,7 @@ conda run --no-capture-output -n "$conda_env" \
   --device cuda \
   --asr-backend transformers \
   --asr-model "$asr_model" \
-  --visual-backend qwen25 \
+  --visual-backend "$vlm_backend" \
   --vlm-model "$vlm_model" \
   --tts-backend transformers \
   --tts-model "$tts_model" \

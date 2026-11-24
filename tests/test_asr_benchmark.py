@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,14 +44,20 @@ class AsrBenchmarkTests(unittest.TestCase):
         self.assertEqual(word_error_rate("Hello, Miss Wilson!", "hello miss wilson"), 0.0)
         self.assertAlmostEqual(word_error_rate("one two three", "one four three"), 1 / 3)
 
-    def test_real_scene_reference_contains_sixteen_dialogue_subtitles(self) -> None:
-        reference = Path(__file__).parents[1] / "references" / "real-scene-01-dialogue.json"
-        intervals, transcript, segments = load_reference(reference)
+    def test_load_reference_merges_contiguous_cues(self) -> None:
+        items = [
+            {"start": 1.0, "end": 2.5, "text": "Good morning."},
+            {"start": 2.5, "end": 4.0, "text": "The door is open."},
+            {"start": 7.0, "end": 8.0, "text": "Come in."},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "dialogue.json"
+            reference.write_text(json.dumps({"segments": items}), encoding="utf-8")
+            intervals, transcript, segments = load_reference(reference)
 
-        self.assertEqual(len(segments), 16)
-        self.assertEqual(len(intervals), 6)
-        self.assertAlmostEqual(sum(item.end - item.start for item in intervals), 87.424)
-        self.assertIn("Miss Wilson", transcript)
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(intervals, [Interval(1.0, 4.0), Interval(7.0, 8.0)])
+        self.assertEqual(transcript, "Good morning. The door is open. Come in.")
 
 
 if __name__ == "__main__":

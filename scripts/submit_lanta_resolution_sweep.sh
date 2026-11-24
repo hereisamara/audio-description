@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-task=1
 #SBATCH -t 24:00:00
-#SBATCH -A lt200246
 #SBATCH -J ad-resolution-sweep
 #SBATCH --output=audio_ad_resolution.%j.out
 #SBATCH --error=audio_ad_resolution.%j.err
@@ -27,7 +26,13 @@ input_name=$(basename "$input_video")
 input_stem=${input_name%.*}
 sweep_root=${2:-"$repo_dir/outputs/resolution-sweep-$input_stem"}
 asr_model=${ASR_MODEL:-"$repo_dir/models/whisper-small.en-transformers"}
-vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
+vlm_backend=${VLM_BACKEND:-qwen3vl8b}
+case "$vlm_backend" in
+  qwen3vl8b) default_vlm=Qwen3-VL-8B-Instruct ;;
+  qwen25) default_vlm=Qwen2.5-VL-3B-Instruct ;;
+  *) echo "VLM_BACKEND must be qwen3vl8b or qwen25." >&2; exit 2 ;;
+esac
+vlm_model=${VLM_MODEL:-"$repo_dir/models/$default_vlm"}
 tts_model=${TTS_MODEL:-"$repo_dir/models/mms-tts-eng"}
 maximum_gaps=${MAXIMUM_GAPS:-12}
 evidence_frames=${EVIDENCE_FRAMES:-6}
@@ -63,6 +68,7 @@ echo "Node: $(hostname)"
 echo "Repository: $repo_dir"
 echo "Input: $input_video"
 echo "Sweep output: $sweep_root"
+echo "Visual model: $vlm_backend ($vlm_model)"
 echo "Evidence max-edge values: ${resolutions[*]}"
 nvidia-smi
 
@@ -81,7 +87,7 @@ for resolution in "${resolutions[@]}"; do
     --device cuda \
     --asr-backend transformers \
     --asr-model "$asr_model" \
-    --visual-backend qwen25 \
+    --visual-backend "$vlm_backend" \
     --vlm-model "$vlm_model" \
     --tts-backend transformers \
     --tts-model "$tts_model" \

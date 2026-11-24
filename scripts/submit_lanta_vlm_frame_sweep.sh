@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1
 #SBATCH -t 02:00:00
-#SBATCH -A lt200246
 #SBATCH -J vlm-frame-sweep
 #SBATCH --output=vlm_frame_sweep.%j.out
 #SBATCH --error=vlm_frame_sweep.%j.err
@@ -26,7 +25,13 @@ input_video=$1
 input_name=$(basename "$input_video")
 input_stem=${input_name%.*}
 output_dir=${2:-"$repo_dir/outputs/vlm-frame-sweep-$input_stem"}
-vlm_model=${VLM_MODEL:-"$repo_dir/models/Qwen2.5-VL-3B-Instruct"}
+vlm_backend=${VLM_BACKEND:-qwen3vl8b}
+case "$vlm_backend" in
+  qwen3vl8b) default_vlm=Qwen3-VL-8B-Instruct ;;
+  qwen25) default_vlm=Qwen2.5-VL-3B-Instruct ;;
+  *) echo "VLM_BACKEND must be qwen3vl8b or qwen25." >&2; exit 2 ;;
+esac
+vlm_model=${VLM_MODEL:-"$repo_dir/models/$default_vlm"}
 frame_timestamp=${FRAME_TIMESTAMP:-31.72}
 resolution_values=${RESOLUTIONS:-"160 320 480 640"}
 read -r -a resolutions <<< "$resolution_values"
@@ -49,13 +54,13 @@ echo "Node: $(hostname)"
 echo "Input: $input_video"
 echo "Frame timestamp: $frame_timestamp"
 echo "Evidence max-edge values: ${resolutions[*]}"
-echo "Only Qwen2.5-VL is loaded; runs are sequential on one GPU."
+echo "Visual model: $vlm_backend ($vlm_model). Runs are sequential on one GPU."
 nvidia-smi
 
 conda run --no-capture-output -n "$conda_env" \
   python -m offline_ad_poc.benchmark_vlm_frame \
   --input "$input_video" \
-  --vlm-model "$vlm_model" \
+  --visual-backend "$vlm_backend" --vlm-model "$vlm_model" \
   --output-dir "$output_dir" \
   --timestamp "$frame_timestamp" \
   --resolutions "${resolutions[@]}"

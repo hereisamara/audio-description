@@ -2,8 +2,8 @@
 """Offline, CPU/GPU-portable audio-description prototype.
 
 This is a research prototype.  The heuristic backend validates the full media
-pipeline but does not claim useful visual-language quality.  The qwen25 backend
-uses only a local model directory and performs no API calls.
+pipeline but does not claim useful visual-language quality. The Qwen backends
+use local checkpoints and perform no API calls.
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 import cv2
 import numpy as np
 
-from .ad_preparer import build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
+from .ad_preparer import DEFAULT_REASONING_TOKENS, build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from .knowledge_db import EvidenceStore
 from .smolvlm import DEFAULT_MAX_NEW_TOKENS
-from .visual_events import apply_ad_policy, direct_ad_text, validate_visual_event
+from .visual_events import apply_ad_policy, description_sentences, direct_ad_text, validate_visual_event
 
 
 LOGGER = logging.getLogger("offline_ad_poc")
@@ -1564,51 +1564,8 @@ def expand_qwen_image_tokens(
     return "".join(expanded)
 
 
-class Qwen25Backend(VisualBackend):
+class QwenEventBackend(VisualBackend):
     uses_event_windows = True
-
-    def __init__(self, model_path: str, device: str) -> None:
-        try:
-            import torch
-            from PIL import Image
-            from transformers import (
-                AutoImageProcessor,
-                AutoTokenizer,
-                Qwen2_5_VLForConditionalGeneration,
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                "Qwen backend requires the Conda pytorch, transformers, accelerate, and Pillow packages."
-            ) from exc
-        self.torch = torch
-        self.image_type = Image
-        self.device = device
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": dtype,
-            "local_files_only": True,
-            "low_cpu_mem_usage": True,
-        }
-        if device == "cuda":
-            model_kwargs["device_map"] = "auto"
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **model_kwargs)
-        if device == "cpu":
-            self.model.to("cpu")
-        self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            model_path,
-            local_files_only=True,
-            use_fast=False,
-        )
-        self.processed_image_grids: list[list[list[int]]] = []
-        self.vision_tokens = 0
-
-    def runtime_metrics(self) -> dict[str, Any]:
-        return {
-            "qwen_image_grid_thw": self.processed_image_grids,
-            "qwen_vision_tokens": self.vision_tokens,
-        }
 
     def decide(
         self,
@@ -1624,11 +1581,13 @@ class Qwen25Backend(VisualBackend):
         action_ready_ids = [index for index in evidence_ids if not frames[index - 1].near_blank]
         expected_ids = ", ".join(map(str, evidence_ids))
         action_ids = ", ".join(map(str, action_ready_ids)) or "none"
-        word_limit = min(18, gap.word_budget)
         defer_word_budget = context.get("defer_word_budget") and not context.get("refine_description")
+        word_limit = 32 if defer_word_budget else min(18, gap.word_budget)
         description_instruction = (
-            "Supply one or two concise, factual sentences as visual evidence for an audio-description editor. "
-            if defer_word_budget else f"Keep description to {word_limit} words or fewer. "
+            "In description, write one short sentence about the main visible action or detail. "
+            "Use a second sentence only if it adds a separate detail essential to following the scene. "
+            "Skip lists of clothing, objects, or background details unless they matter to the event. "
+            f"Use at most two sentences and {word_limit} words total. "
         )
         if context.get("scene_fallback"):
             description_instruction += "Describe the main new visible detail of this scene in one concise line. "
@@ -1673,26 +1632,30 @@ class Qwen25Backend(VisualBackend):
             )
             instruction = prompt
         for _ in range(1 if context.get("refine_description") else 2):
+            attempt = {"prompt": instruction, "recent_dialogue": transcript}
             try:
                 decoded = self._generate(frames, [*content, {"type": "text", "text": instruction}])
             except Exception as exc:
                 LOGGER.exception("vlm_generation_failure window=%.3f-%.3f", gap.start, gap.end)
-                attempts.append({"generation_error": f"{type(exc).__name__}: {exc}"})
+                attempts.append({**attempt, "generation_error": f"{type(exc).__name__}: {exc}"})
                 return {"decision": "WAIT", "reason": "vlm_generation_failure", "attempts": attempts}
             try:
                 proposal = validate_visual_event(
                     json_object_from_text(decoded), timestamps, gap.start, gap.end,
                     action_ready_ids=action_ready_ids,
                 )
-                if not defer_word_budget and len(proposal["description"].split()) > word_limit:
+                description = proposal["description"]
+                if len(description_sentences(description)) > 2:
+                    raise ValueError("description exceeds the two-sentence limit")
+                if len(description.split()) > word_limit:
                     raise ValueError(f"description exceeds the {word_limit}-word budget")
             except ValueError as exc:
-                attempts.append({"raw_output": decoded, "validation_error": str(exc)})
+                attempts.append({**attempt, "raw_output": decoded, "validation_error": str(exc)})
                 LOGGER.warning("vlm_event_invalid window=%.3f-%.3f attempt=%d error=%s",
                                gap.start, gap.end, len(attempts), exc)
                 instruction = f"{prompt}\nThe previous answer failed validation: {exc}. Correct it."
                 continue
-            attempts.append({"raw_output": decoded})
+            attempts.append({**attempt, "raw_output": decoded})
             return {**apply_ad_policy(proposal, timestamps), "proposal": proposal, "attempts": attempts}
         return {"decision": "WAIT", "reason": "invalid_vlm_output", "attempts": attempts}
 
@@ -1725,6 +1688,36 @@ class Qwen25Backend(VisualBackend):
         except ValueError as exc:
             return {"relation": "uncertain", "raw_output": decoded, "validation_error": str(exc)}
         return {"relation": relation, "raw_output": decoded}
+
+    def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
+        raise NotImplementedError
+
+
+class QwenTransformersBackend(QwenEventBackend):
+    """Shared image-only Transformers path for Qwen2.5-VL and Qwen3-VL."""
+
+    def __init__(self, model_path: str, model_class: Any, **model_kwargs: Any) -> None:
+        import torch
+        from PIL import Image
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        self.torch = torch
+        self.image_type = Image
+        self.model = model_class.from_pretrained(
+            model_path, local_files_only=True, low_cpu_mem_usage=True, **model_kwargs,
+        ).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            model_path, local_files_only=True, use_fast=False,
+        )
+        self.processed_image_grids: list[list[list[int]]] = []
+        self.vision_tokens = 0
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        return {
+            "qwen_image_grid_thw": self.processed_image_grids,
+            "qwen_vision_tokens": self.vision_tokens,
+        }
 
     def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
         messages = [{"role": "user", "content": content}]
@@ -1776,6 +1769,87 @@ class Qwen25Backend(VisualBackend):
         )[0]
 
 
+class Qwen25Backend(QwenTransformersBackend):
+    def __init__(self, model_path: str, device: str) -> None:
+        import torch
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        kwargs = {"torch_dtype": torch.float16 if device == "cuda" else torch.float32}
+        if device == "cuda":
+            kwargs["device_map"] = "auto"
+        super().__init__(model_path, Qwen2_5_VLForConditionalGeneration, **kwargs)
+
+
+class Qwen3VL8BBackend(QwenTransformersBackend):
+    """Run the local Transformers checkpoint on the selected NVIDIA GPU."""
+
+    def __init__(self, model_path: str, device: str) -> None:
+        import torch
+
+        if device != "cuda" or not torch.cuda.is_available():
+            raise ValueError("Qwen3-VL-8B requires CUDA. Use the Qwen3-VL-2B profile for CPU.")
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+        except ImportError as exc:
+            raise RuntimeError("Qwen3-VL-8B requires Transformers 4.57.6 or newer in the GPU Conda environment.") from exc
+        gpu = torch.cuda.current_device()
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability(gpu)[0] >= 8 else torch.float16
+        LOGGER.info("model_load backend=qwen3vl8b checkpoint=%s dtype=%s cuda_device=%d",
+                    model_path, dtype, gpu)
+        super().__init__(
+            model_path, Qwen3VLForConditionalGeneration, dtype=dtype,
+            device_map={"": gpu}, attn_implementation="sdpa", use_safetensors=True,
+        )
+
+
+class Qwen3VLBackend(QwenEventBackend):
+    """Run Qwen3-VL GGUF on CPU with the same events and prompt as Qwen2.5-VL."""
+
+    def __init__(self, model_path: str, mmproj: Path, executable: str) -> None:
+        self.model_path = Path(model_path).resolve()
+        self.mmproj = mmproj.resolve()
+        resolved = shutil.which(executable)
+        if not resolved or not self.model_path.is_file() or not self.mmproj.is_file():
+            raise ValueError("Qwen3-VL requires local GGUF weights, a vision projector, and llama-mtmd-cli")
+        self.executable = resolved
+        self.calls = 0
+        self.images = 0
+
+    def runtime_metrics(self) -> dict[str, Any]:
+        return {"qwen3vl_calls": self.calls, "qwen3vl_images": self.images,
+                "qwen3vl_max_new_tokens": 160, "qwen3vl_cpu_threads": 4}
+
+    def _generate(self, frames: Sequence[EvidenceFrame], content: list[dict[str, Any]]) -> str:
+        marker = "<__media__>"
+        prompt = "\n".join(
+            marker if part["type"] == "image" else part["text"].replace(marker, "[media]")
+            for part in content
+        )
+        paths = [str(Path(frame.path).resolve()) for frame in frames]
+        # The mtmd CLI accepts a single comma-separated image list. Pass image
+        # paths relative to the window directory, which may itself contain commas.
+        common_dir = Path(os.path.commonpath([str(Path(path).parent) for path in paths]))
+        images = ",".join(os.path.relpath(path, common_dir) for path in paths)
+        self.calls += 1
+        self.images += len(paths)
+        result = subprocess.run(
+            [
+                self.executable, "--offline", "--device", "none", "-ngl", "0",
+                "--no-mmproj-offload", "--no-op-offload", "--no-warmup",
+                "-t", "4", "-tb", "4", "-c", "4096", "-n", "160",
+                "--temp", "0", "--seed", "42", "-m", str(self.model_path),
+                "--mmproj", str(self.mmproj), "--image", images,
+                "--json-schema", '{"type":"object"}', "-p", prompt,
+            ],
+            cwd=common_dir, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip()
+                               else f"llama-mtmd-cli exited with status {result.returncode}")
+        return result.stdout.strip()
+
+
+
 def context_for_gap(
     gap: Gap,
     shots: Sequence[Shot],
@@ -1821,6 +1895,7 @@ def limit_words(text: str, maximum: int) -> str:
 
 def choose_backend(
     name: str, model_path: str | None, device: str, *, smolvlm_max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    vlm_mmproj: Path | None = None, vlm_executable: str = "llama-mtmd-cli",
 ) -> VisualBackend:
     if name == "smolvlm":
         if not model_path:
@@ -1832,6 +1907,16 @@ def choose_backend(
     if name == "heuristic":
         LOGGER.info("method stage=visual_backend backend=heuristic device=cpu")
         return HeuristicBackend()
+    if name == "qwen3vl":
+        if not model_path or not vlm_mmproj:
+            raise ValueError("--vlm-model and --vlm-mmproj are required for --visual-backend qwen3vl")
+        LOGGER.info("method stage=visual_backend backend=qwen3-vl-2b device=cpu runtime=llama-mtmd-cli")
+        return Qwen3VLBackend(model_path, vlm_mmproj, vlm_executable)
+    if name == "qwen3vl8b":
+        if not model_path:
+            raise ValueError("--vlm-model is required for --visual-backend qwen3vl8b")
+        LOGGER.info("method stage=visual_backend backend=qwen3-vl-8b device=%s", device)
+        return Qwen3VL8BBackend(model_path, device)
     if name == "qwen25":
         if not model_path:
             raise ValueError("--vlm-model is required for --visual-backend qwen25")
@@ -2780,7 +2865,11 @@ def evaluate(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output-video", type=Path, required=True)
+    parser.add_argument("--output-video", type=Path, help="Described MP4 (required for AD generation)")
+    dialogue = parser.add_mutually_exclusive_group()
+    dialogue.add_argument("--dialogue-only", action="store_true", help="Export dialogue-result.json and the analysis WAV")
+    dialogue.add_argument("--dialogue-input", type=Path, help="Resume AD generation from a saved dialogue result")
+    parser.add_argument("--analysis-audio", type=Path, help="Reuse the dialogue worker's analysis WAV")
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument(
@@ -2795,14 +2884,16 @@ def parse_args() -> argparse.Namespace:
         help="Local Whisper model directory; model downloading is disabled by default",
     )
     parser.add_argument("--allow-model-download", action="store_true", help="Disabled by default for offline runs")
-    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25", "smolvlm"], default="heuristic")
+    parser.add_argument("--visual-backend", choices=["heuristic", "qwen25", "qwen3vl", "qwen3vl8b", "smolvlm"], default="heuristic")
     parser.add_argument("--smolvlm-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
                         help="Maximum generated tokens per SmolVLM frame")
-    parser.add_argument("--vlm-model", help="Local Qwen2.5-VL model directory")
+    parser.add_argument("--vlm-model", help="Local VLM model directory or Qwen3-VL GGUF")
+    parser.add_argument("--vlm-mmproj", type=Path, help="Local Qwen3-VL vision projector GGUF")
+    parser.add_argument("--vlm-executable", default="llama-mtmd-cli", help="Local Qwen3-VL CPU executable")
     parser.add_argument("--ad-preparer-model", type=Path, help="Optional local Qwen3-1.7B GGUF for cue editing")
     parser.add_argument("--ad-preparer-executable", default="llama-completion", help="Path to llama-completion")
-    parser.add_argument("--ad-preparer-reasoning-tokens", type=int, default=0,
-                        help="Optional CPU thinking pass before the final AD JSON (0 disables it)")
+    parser.add_argument("--ad-preparer-reasoning-tokens", type=int,
+                        help=f"CPU thinking budget when the editor is enabled (default: {DEFAULT_REASONING_TOKENS}; 0 disables it)")
     parser.add_argument(
         "--tts-backend",
         choices=["auto", "transformers", "piper", "espeak-ng", "say"],
@@ -2844,82 +2935,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shot-threshold", type=float, default=27.0)
     parser.add_argument("--scene-threshold", type=float, default=0.52)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.dialogue_only and args.output_video is None:
+        parser.error("--output-video is required for AD generation")
+    if args.analysis_audio and not args.dialogue_input:
+        parser.error("--analysis-audio requires --dialogue-input")
+    return args
 
 
-def main() -> None:
-    args = parse_args()
-    if args.smolvlm_max_new_tokens < 1:
-        raise ValueError("--smolvlm-max-new-tokens must be positive")
-    if not 0 <= args.ad_preparer_reasoning_tokens <= 512:
-        raise ValueError("--ad-preparer-reasoning-tokens must be between 0 and 512")
-    if args.ad_preparer_reasoning_tokens and not args.ad_preparer_model:
-        raise ValueError("--ad-preparer-reasoning-tokens requires --ad-preparer-model")
-    generate_cue = None
-    if args.ad_preparer_model:
-        model_path = args.ad_preparer_model.resolve()
-        executable = shutil.which(args.ad_preparer_executable)
-        if not model_path.is_file() or not executable:
-            raise ValueError("AD preparation requires a local GGUF file and an executable llama-completion")
-        generate_cue = lambda llm_input: run_qwen_cue(executable, model_path, llm_input)
-    if args.evidence_max_edge < 0:
-        raise ValueError("--evidence-max-edge must be zero or a positive integer")
-    if args.evidence_frames < 3:
-        raise ValueError("--evidence-frames must be at least 3")
-    if args.event_followups < 0:
-        raise ValueError("--event-followups must be zero or a positive integer")
-    if args.qwen_seconds_per_call is not None and (
-        not math.isfinite(args.qwen_seconds_per_call) or args.qwen_seconds_per_call <= 0
-    ):
-        raise ValueError("--qwen-seconds-per-call must be finite and positive")
-    started = time.perf_counter()
-    input_video = args.input.resolve()
-    output_video = args.output_video.resolve()
-    work_dir = args.work_dir.resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    configure_logging(work_dir)
-    LOGGER.info(
-        "pipeline_start input=%s output=%s requested_device=%s asr_backend=%s "
-        "visual_backend=%s tts_backend=%s",
-        input_video,
-        output_video,
-        args.device,
-        args.asr_backend,
-        args.visual_backend,
-        args.tts_backend,
-    )
-    if not input_video.exists():
-        raise FileNotFoundError(input_video)
-    profiler = RuntimeProfiler(work_dir)
-
-    with profiler.stage("media_tools", method="environment_or_path_lookup", compute_device="cpu"):
-        ffmpeg, ffprobe = resolve_ffmpeg_tools()
-    with profiler.stage("media_probe", method="ffprobe", compute_device="cpu") as stage:
-        media = probe_media(input_video, ffprobe)
-        stage.update(
-            duration_seconds=round(media.duration, 6),
-            width=media.width,
-            height=media.height,
-            fps=round(media.fps, 6),
-            has_audio=media.has_audio,
-        )
-    if not media.has_audio:
-        raise ValueError("Prototype currently requires an input audio stream")
-    with profiler.stage("device_selection", method="cuda_capability_check", compute_device="cpu") as stage:
-        device = choose_device(args.device)
-        stage.update(requested_device=args.device, selected_device=device)
-    if args.device == "cuda" and device != "cuda":
-        raise RuntimeError("CUDA was requested but is not available")
-    with profiler.stage("hardware_probe", method="python_platform_and_torch", compute_device="cpu"):
-        profiler.set_hardware(collect_hardware_info())
-
-    analysis_wav = work_dir / "analysis-audio.wav"
-    with profiler.stage(
-        "audio_extraction",
-        method="ffmpeg_pcm_s16le_16khz_mono",
-        compute_device="cpu",
-    ):
-        extract_analysis_audio(input_video, analysis_wav, ffmpeg)
+def analyze_dialogue(
+    args: argparse.Namespace, media: MediaInfo, analysis_wav: Path,
+    device: str, profiler: RuntimeProfiler,
+) -> dict:
+    """Run the same dialogue analysis for standalone and combined jobs."""
     with profiler.stage("audio_silence_check", method="pcm_exact_zero", compute_device="cpu") as stage:
         silent_audio = analysis_audio_is_silent(analysis_wav)
         stage.update(silent=silent_audio)
@@ -2988,6 +3016,138 @@ def main() -> None:
         gap_audit: list[dict[str, Any]] = []
         gaps = build_gaps(speech, media.duration, minimum_duration=args.minimum_gap, audit=gap_audit)
         stage.update(speech_intervals=len(speech), candidate_gaps=len(gaps))
+    return {
+        "schema_version": 1,
+        "media": asdict(media),
+        "transcript": {
+            "report": {
+                **asr_report,
+                "raw_segments": len(raw_segments),
+                "raw_words": len(raw_words),
+                "validated_segments": len(segments),
+                "validated_words": len(words),
+            },
+            "segments": [asdict(row) for row in segments],
+            "words": [asdict(row) for row in words],
+            "raw_segments": [asdict(row) for row in raw_segments],
+            "raw_words": [asdict(row) for row in raw_words],
+        },
+        "dialogue_validation": dialogue_validation_report,
+        "speech_and_gaps": {
+            "speech": [asdict(row) for row in speech],
+            "gaps": [asdict(row) for row in gaps],
+            "gap_audit": gap_audit,
+        },
+    }
+
+
+def write_dialogue_artifacts(work_dir: Path, dialogue: dict) -> None:
+    write_json(work_dir / "media.json", dialogue["media"])
+    write_json(work_dir / "transcript.json", dialogue["transcript"])
+    write_json(work_dir / "dialogue-validation.json", dialogue["dialogue_validation"])
+    write_json(work_dir / "speech-and-gaps.json", dialogue["speech_and_gaps"])
+
+
+def main() -> None:
+    args = parse_args()
+    if args.smolvlm_max_new_tokens < 1:
+        raise ValueError("--smolvlm-max-new-tokens must be positive")
+    if args.ad_preparer_reasoning_tokens is None:
+        args.ad_preparer_reasoning_tokens = DEFAULT_REASONING_TOKENS if args.ad_preparer_model else 0
+    if not 0 <= args.ad_preparer_reasoning_tokens <= 512:
+        raise ValueError("--ad-preparer-reasoning-tokens must be between 0 and 512")
+    if args.ad_preparer_reasoning_tokens and not args.ad_preparer_model:
+        raise ValueError("--ad-preparer-reasoning-tokens requires --ad-preparer-model")
+    generate_cue = None
+    if args.ad_preparer_model:
+        model_path = args.ad_preparer_model.resolve()
+        executable = shutil.which(args.ad_preparer_executable)
+        if not model_path.is_file() or not executable:
+            raise ValueError("AD preparation requires a local GGUF file and an executable llama-completion")
+        generate_cue = lambda llm_input: run_qwen_cue(executable, model_path, llm_input)
+    if args.evidence_max_edge < 0:
+        raise ValueError("--evidence-max-edge must be zero or a positive integer")
+    minimum_evidence_frames = 2 if args.visual_backend == "qwen3vl" else 3
+    if args.evidence_frames < minimum_evidence_frames:
+        raise ValueError(f"--evidence-frames must be at least {minimum_evidence_frames}")
+    if args.event_followups < 0:
+        raise ValueError("--event-followups must be zero or a positive integer")
+    if args.qwen_seconds_per_call is not None and (
+        not math.isfinite(args.qwen_seconds_per_call) or args.qwen_seconds_per_call <= 0
+    ):
+        raise ValueError("--qwen-seconds-per-call must be finite and positive")
+    started = time.perf_counter()
+    input_video = args.input.resolve()
+    output_video = args.output_video.resolve() if args.output_video else None
+    work_dir = args.work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(work_dir)
+    LOGGER.info(
+        "pipeline_start input=%s output=%s requested_device=%s asr_backend=%s "
+        "visual_backend=%s tts_backend=%s",
+        input_video,
+        output_video,
+        args.device,
+        args.asr_backend,
+        args.visual_backend,
+        args.tts_backend,
+    )
+    if not input_video.exists():
+        raise FileNotFoundError(input_video)
+    profiler = RuntimeProfiler(work_dir)
+
+    with profiler.stage("media_tools", method="environment_or_path_lookup", compute_device="cpu"):
+        ffmpeg, ffprobe = resolve_ffmpeg_tools()
+    with profiler.stage("media_probe", method="ffprobe", compute_device="cpu") as stage:
+        media = probe_media(input_video, ffprobe)
+        stage.update(
+            duration_seconds=round(media.duration, 6),
+            width=media.width,
+            height=media.height,
+            fps=round(media.fps, 6),
+            has_audio=media.has_audio,
+        )
+    if not media.has_audio:
+        raise ValueError("Prototype currently requires an input audio stream")
+    with profiler.stage("device_selection", method="cuda_capability_check", compute_device="cpu") as stage:
+        device = choose_device(args.device)
+        stage.update(requested_device=args.device, selected_device=device)
+    if args.device == "cuda" and device != "cuda":
+        raise RuntimeError("CUDA was requested but is not available")
+    with profiler.stage("hardware_probe", method="python_platform_and_torch", compute_device="cpu"):
+        profiler.set_hardware(collect_hardware_info())
+
+    analysis_wav = args.analysis_audio.resolve() if args.analysis_audio else work_dir / "analysis-audio.wav"
+    if not args.analysis_audio:
+        with profiler.stage(
+            "audio_extraction",
+            method="ffmpeg_pcm_s16le_16khz_mono",
+            compute_device="cpu",
+        ):
+            extract_analysis_audio(input_video, analysis_wav, ffmpeg)
+    elif not analysis_wav.is_file():
+        raise FileNotFoundError(analysis_wav)
+
+    if args.dialogue_input:
+        with profiler.stage("dialogue_import", method="saved_dialogue_result", compute_device="cpu") as stage:
+            dialogue = json.loads(args.dialogue_input.read_text(encoding="utf-8"))
+            if dialogue.get("schema_version") != 1 or dialogue.get("media") != asdict(media):
+                raise ValueError("Dialogue result version or media metadata does not match the input video")
+            stage.update(candidate_gaps=len(dialogue["speech_and_gaps"]["gaps"]))
+    else:
+        dialogue = analyze_dialogue(args, media, analysis_wav, device, profiler)
+
+    if args.dialogue_only:
+        write_json(work_dir / "dialogue-result.json", dialogue)
+        write_dialogue_artifacts(work_dir, dialogue)
+        profiler.finalize()
+        return
+
+    segments = [TranscriptSegment(**row) for row in dialogue["transcript"]["segments"]]
+    words = [Word(**row) for row in dialogue["transcript"]["words"]]
+    speech = [Interval(**row) for row in dialogue["speech_and_gaps"]["speech"]]
+    gaps = [Gap(**row) for row in dialogue["speech_and_gaps"]["gaps"]]
+    gap_audit = dialogue["speech_and_gaps"]["gap_audit"]
 
     with profiler.stage("shot_detection", compute_device="cpu") as stage:
         shots = detect_shots(
@@ -3071,22 +3231,25 @@ def main() -> None:
         )
 
     qwen_plan = None
-    if args.visual_backend == "qwen25":
+    qwen_event_backend = args.visual_backend in {"qwen25", "qwen3vl", "qwen3vl8b"}
+    if qwen_event_backend:
         qwen_plan = plan_qwen_calls(
             gaps, args.maximum_gaps, args.event_followups if args.ad_plan == "multi" else 0,
             args.qwen_seconds_per_call,
         )
         LOGGER.info("qwen_call_plan %s", json.dumps(qwen_plan))
-    visual_compute_device = device if args.visual_backend in {"qwen25", "smolvlm"} else "cpu"
-    followup_budget = args.event_followups if args.visual_backend == "qwen25" else 0
-    defer_word_budget = args.visual_backend == "qwen25" and generate_cue is not None
+    visual_compute_device = device if args.visual_backend in {"qwen25", "qwen3vl8b", "smolvlm"} else "cpu"
+    followup_budget = args.event_followups if qwen_event_backend else 0
+    defer_word_budget = qwen_event_backend and generate_cue is not None
     with profiler.stage(
         "visual_backend_initialization",
         method=args.visual_backend,
         compute_device=visual_compute_device,
+        model=args.vlm_model,
     ):
         backend = choose_backend(
             args.visual_backend, args.vlm_model, device, smolvlm_max_new_tokens=args.smolvlm_max_new_tokens,
+            vlm_mmproj=args.vlm_mmproj, vlm_executable=args.vlm_executable,
         )
     with profiler.stage(
         "ad_decisions",
@@ -3098,7 +3261,7 @@ def main() -> None:
         event_followup_budget=followup_budget if args.ad_plan == "multi" else 0,
         evidence_sampling="temporal_windows" if backend.uses_event_windows else "adaptive_visual_change_and_boundaries",
     ) as stage:
-        if args.visual_backend == "qwen25":
+        if qwen_event_backend:
             stage["word_budget_stage"] = "ad_preparation" if defer_word_budget else "visual_review"
         decisions = make_decisions(
             input_video,
@@ -3242,28 +3405,7 @@ def main() -> None:
     with profiler.stage("artifact_write", method="json_and_webvtt", compute_device="cpu"):
         write_json(work_dir / "ad-preparation.json", prepared)
         write_vtt(decisions, work_dir / "descriptions.vtt")
-        write_json(work_dir / "media.json", asdict(media))
-        write_json(
-            work_dir / "transcript.json",
-            {
-                "report": {
-                    **asr_report,
-                    "raw_segments": len(raw_segments),
-                    "raw_words": len(raw_words),
-                    "validated_segments": len(segments),
-                    "validated_words": len(words),
-                },
-                "segments": [asdict(x) for x in segments],
-                "words": [asdict(x) for x in words],
-                "raw_segments": [asdict(x) for x in raw_segments],
-                "raw_words": [asdict(x) for x in raw_words],
-            },
-        )
-        write_json(work_dir / "dialogue-validation.json", dialogue_validation_report)
-        write_json(
-            work_dir / "speech-and-gaps.json",
-            {"speech": [asdict(x) for x in speech], "gaps": [asdict(x) for x in gaps], "gap_audit": gap_audit},
-        )
+        write_dialogue_artifacts(work_dir, dialogue)
         write_json(work_dir / "shots.json", [asdict(x) for x in shots])
         write_json(work_dir / "shot-boundary-validation.json", shot_validation)
         write_json(work_dir / "scenes.json", [asdict(x) for x in scenes])

@@ -15,6 +15,25 @@ NARRATOR_LEAD_IN = re.compile(
     re.IGNORECASE,
 )
 
+SENTENCE_END = re.compile(r"""[.!?]+(?:["'”’)\]]+)?(?=\s|$)""")
+ABBREVIATION = re.compile(r"(?:\b(?i:mr|mrs|ms|dr|prof|sr|jr|st|no|vs)\.|\b[A-Z]\.|\b(?:[A-Za-z]\.){2,})$")
+
+
+def description_sentences(text: str) -> list[str]:
+    """Split short descriptions while keeping titles and acronyms together."""
+    sentences = []
+    start = 0
+    for match in SENTENCE_END.finditer(text):
+        end = match.end()
+        if match.group() == "." and text[end:].strip() and ABBREVIATION.search(text[start:end]):
+            continue
+        if sentence := text[start:end].strip():
+            sentences.append(sentence)
+        start = end
+    if remainder := text[start:].strip():
+        sentences.append(remainder)
+    return sentences
+
 
 def direct_ad_text(text: str) -> str:
     """Keep the visual description and remove a preceding narrator phrase."""

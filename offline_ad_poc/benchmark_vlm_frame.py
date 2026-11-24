@@ -10,14 +10,15 @@ from typing import Any
 
 import cv2
 
-from .pipeline import EvidenceFrame, Gap, Qwen25Backend, frame_at, resize_frame_max_edge
+from .pipeline import EvidenceFrame, Gap, choose_backend, frame_at, resize_frame_max_edge
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark one fixed video frame with Qwen2.5-VL at multiple resolutions."
+        description="Benchmark one fixed video frame with the GPU Qwen backend at multiple resolutions."
     )
     parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--visual-backend", choices=["qwen3vl8b", "qwen25"], default="qwen3vl8b")
     parser.add_argument("--vlm-model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timestamp", type=float, required=True)
@@ -98,7 +99,7 @@ def main() -> None:
 
     torch.cuda.synchronize()
     initialization_started = time.perf_counter()
-    backend = Qwen25Backend(args.vlm_model, "cuda")
+    backend = choose_backend(args.visual_backend, args.vlm_model, "cuda")
     torch.cuda.synchronize()
     initialization_seconds = time.perf_counter() - initialization_started
 
@@ -209,6 +210,7 @@ def main() -> None:
         "source_width": source_width,
         "source_height": source_height,
         "model": args.vlm_model,
+        "visual_backend": args.visual_backend,
         "device": "cuda",
         "gpu_name": torch.cuda.get_device_name(),
         "model_initialization_seconds": round(initialization_seconds, 6),

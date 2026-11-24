@@ -10,12 +10,13 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
-from .visual_events import direct_ad_text
+from .visual_events import description_sentences, direct_ad_text
 
 if TYPE_CHECKING:
     from .pipeline import Decision, Scene, Shot, Word
 
 
+DEFAULT_REASONING_TOKENS = 96
 UNFINISHED_ENDINGS = {"a", "an", "the", "to", "of", "in", "on", "at", "with", "and", "or"}
 DEMONSTRATIVE_REFERENCE = re.compile(
     r"\b(?:(?:here(?:'s| is| are)|this is|these are)(?: an example of)?|an example of|look at) "
@@ -103,6 +104,8 @@ def validate_prepared_reply(context: dict, suggestion: str, reference: str) -> t
         return "ad_preparer_wait", ""
     if "\n" in suggestion or incomplete_cue(suggestion):
         return "incomplete_visual_description", ""
+    if len(description_sentences(suggestion)) > 1:
+        return "ad_preparer_sentence_limit", ""
     if len(suggestion.split()) > context["max_words"]:
         return "ad_preparer_word_limit", ""
     if context["incomplete"]:
@@ -115,15 +118,23 @@ def validate_prepared_reply(context: dict, suggestion: str, reference: str) -> t
     return "ad_preparer_ungrounded_rewrite", ""
 
 
-def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
+def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = DEFAULT_REASONING_TOKENS) -> dict:
     budget = context["max_words"]
     instruction = (
         "You are the final editor of one audio-description cue. Read the input JSON as evidence. "
         "Describe the most useful visible detail that dialogue leaves out. If the same action and object "
         "are already described in dialogue, put WAIT in description. Unrelated dialogue leaves the visual draft usable. "
-        "Write a direct, present-tense line in third person. Keep the main action and drop secondary details. "
+        "Rewrite the visual draft as one concise, natural sentence in third person and present tense. "
+        "Use a visible action or position from the draft and preserve the verb's meaning. "
+        "When dialogue supplies the speech, give priority to what the person visibly does. "
+        "Drop secondary details or repeated information. "
         f"The description may contain at most {budget} words. Return a JSON object.\n"
     )
+    if reasoning_tokens:
+        instruction += (
+            "Before writing, weigh what the frames support, what the dialogue already conveys, and what fits. "
+            "Keep that deliberation out of the JSON and return only the final cue or WAIT.\n"
+        )
     if "available_seconds" in context:
         instruction += (
             f"The safe narration slot is {context['available_seconds']:.2f} seconds. "
@@ -160,7 +171,9 @@ def build_qwen_cue_input(context: dict, *, reasoning_tokens: int = 0) -> dict:
             'Draft: A person sets a bowl on the table. Dialogue: She sets a bowl on the table. '
             'Output: {"description":"WAIT","dialogue_reference":""}\n'
             'Draft: A person lifts a blue bowl from the counter. Dialogue: none. Max words: 5. '
-            'Output: {"description":"A person lifts a bowl.","dialogue_reference":""}'
+            'Output: {"description":"A person lifts a bowl.","dialogue_reference":""}\n'
+            'Draft: A child stands beside a bench while a man talks. Dialogue: Please wait. Max words: 8. '
+            'Output: {"description":"A child stands beside a bench.","dialogue_reference":""}'
         )
         schema = {**CUE_SCHEMA, "properties": {**CUE_SCHEMA["properties"], "dialogue_reference": {"const": ""}}}
     data = json.dumps(context, ensure_ascii=True).replace("<", "\\u003c")
@@ -281,8 +294,10 @@ def prepare_ad_cues(
         available = narration_seconds(decision) if generate is not None and narration_seconds is not None else None
         if available is not None:
             budget = min(budget, math.floor(available * 2.5))
-        if generate is not None and len(fallback.split()) > budget:
-            fallback = ""
+        if generate is not None and fallback:
+            fallback = description_sentences(fallback)[0]
+            if incomplete_cue(fallback) or len(fallback.split()) > budget:
+                fallback = ""
         if shot is not None:
             dialogue = [word for word in words if start <= word.start and word.end <= anchor][-60:]
             if incomplete:

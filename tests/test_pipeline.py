@@ -18,6 +18,9 @@ from offline_ad_poc.pipeline import (
     Decision,
     EvidenceFrame,
     Qwen25Backend,
+    Qwen3VL8BBackend,
+    Qwen3VLBackend,
+    QwenTransformersBackend,
     RuntimeProfiler,
     Scene,
     Shot,
@@ -537,6 +540,74 @@ class PipelineUnitTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             expand_qwen_image_tokens("<|image_pad|>", "<|image_pad|>", [[1, 4, 4]] * 2, 2)
+
+    def test_qwen3_8b_loads_on_one_cuda_device_with_bf16(self) -> None:
+        from types import SimpleNamespace
+
+        cuda = SimpleNamespace(
+            is_available=lambda: True, current_device=lambda: 0, get_device_capability=lambda _: (8, 0),
+        )
+        torch = SimpleNamespace(cuda=cuda, bfloat16="bf16", float16="fp16")
+        model = object()
+        transformers = SimpleNamespace(Qwen3VLForConditionalGeneration=model)
+        with patch.dict("sys.modules", {"torch": torch, "transformers": transformers}):
+            with patch.object(QwenTransformersBackend, "__init__", return_value=None) as load:
+                Qwen3VL8BBackend("/models/Qwen3-VL-8B-Instruct", "cuda")
+                load.assert_called_once_with(
+                    "/models/Qwen3-VL-8B-Instruct", model, dtype="bf16",
+                    device_map={"": 0}, attn_implementation="sdpa", use_safetensors=True,
+                )
+            with self.assertRaisesRegex(ValueError, "requires CUDA"):
+                Qwen3VL8BBackend("/models/Qwen3-VL-8B-Instruct", "cpu")
+
+    def test_qwen_backends_share_event_prompt_and_preserve_dialogue(self) -> None:
+        frames = [EvidenceFrame("frog.jpg", 2, 2, 1, 1)]
+        proposal = json.dumps({
+            "kind": "detail", "important": True, "already_audible": False, "uncertain": False,
+            "frame_ids": [1], "ready_frame_id": 1, "description": "A hand holds an egg mass.",
+        })
+        prompts = []
+        for backend_cls in (Qwen25Backend, Qwen3VLBackend, Qwen3VL8BBackend):
+            backend = backend_cls.__new__(backend_cls)
+            with patch.object(backend, "_generate", return_value=proposal) as generate:
+                result = backend.decide(frames, Gap(1, 5, 9), "This is an egg mass.", [], {})
+            prompt = generate.call_args.args[1][-1]["text"]
+            self.assertIn("Recent dialogue: This is an egg mass.", prompt)
+            self.assertEqual(result["attempts"][0]["recent_dialogue"], "This is an egg mass.")
+            self.assertEqual(result["attempts"][0]["prompt"], prompt)
+            self.assertEqual(result["description_ready_at"], 2)
+            prompts.append(prompt)
+        self.assertTrue(all(prompt == prompts[0] for prompt in prompts[1:]))
+
+    def test_qwen_retries_long_editor_draft_and_accepts_two_short_sentences(self) -> None:
+        backend = Qwen3VLBackend.__new__(Qwen3VLBackend)
+        frames = [EvidenceFrame("desk.jpg", 2, 2, 1, 1)]
+        event = {"kind": "action", "important": True, "already_audible": False, "uncertain": False,
+                 "frame_ids": [1], "ready_frame_id": 1}
+        long = ("A man stands at a desk. A woman types. He wears a tie. "
+                "The wall is dark. He has his hands in his pockets.")
+        short = "A man stands beside a woman at a desk. She types."
+        answers = [json.dumps({**event, "description": text}) for text in (long, short)]
+        with patch.object(backend, "_generate", side_effect=answers):
+            result = backend.decide(frames, Gap(1, 5, 8), "", [], {"defer_word_budget": True})
+        self.assertEqual(result["description"], short)
+        self.assertIn("two-sentence limit", result["attempts"][0]["validation_error"])
+        self.assertIn("Use a second sentence only", result["attempts"][0]["prompt"])
+
+    def test_editor_defaults_to_reasoning_and_rejects_a_second_sentence(self) -> None:
+        from offline_ad_poc.ad_preparer import validate_prepared_reply
+        from offline_ad_poc.visual_events import description_sentences
+
+        draft = "Dr. Hall stands beside a U.S. flag. He turns."
+        context = {"draft": draft, "max_words": 18, "incomplete": False,
+                   "dialogue": "", "identifying_dialogue": []}
+        request = build_qwen_cue_input(context)
+        self.assertEqual(request["generation"]["reasoning_tokens"], 96)
+        self.assertIn("Keep that deliberation out of the JSON", request["system_prompt"])
+        self.assertEqual(description_sentences(draft), ["Dr. Hall stands beside a U.S. flag.", "He turns."])
+        self.assertEqual(len(description_sentences("A title names Joseph A. Jackson.")), 1)
+        self.assertEqual(validate_prepared_reply(context, draft, "")[0], "ad_preparer_sentence_limit")
+        self.assertEqual(validate_prepared_reply(context, "Dr. Hall stands beside a U.S. flag.", ""), (None, ""))
 
     def test_visual_event_retry_preserves_outputs_and_rejects_context_ids(self) -> None:
         backend = Qwen25Backend.__new__(Qwen25Backend)
