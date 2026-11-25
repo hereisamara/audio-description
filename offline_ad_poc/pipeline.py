@@ -35,6 +35,8 @@ import numpy as np
 from .ad_preparer import DEFAULT_REASONING_TOKENS, build_qwen_cue_input, prepare_ad_cues, retry_prepared_cue, run_qwen_cue
 from .knowledge_db import EvidenceStore
 from .smolvlm import DEFAULT_MAX_NEW_TOKENS
+from .tts_client import synthesize as synthesize_remote_tts
+from .tts_model import synthesize_transformers_tts
 from .visual_events import apply_ad_policy, description_sentences, direct_ad_text, validate_visual_event
 
 
@@ -2321,7 +2323,13 @@ def resolve_tts_backend(
     requested: str,
     piper_model: str | None,
     transformers_model: str | None,
+    tts_url: str | None = None,
 ) -> tuple[str, str]:
+    if requested == "http":
+        if not tts_url:
+            raise ValueError("--tts-backend http requires --tts-url.")
+        LOGGER.info("method stage=tts backend=http device=cpu service=tts")
+        return requested, tts_url
     candidates = [requested] if requested != "auto" else ["transformers", "piper", "espeak-ng", "say"]
     for candidate in candidates:
         if candidate == "transformers" and transformers_model:
@@ -2340,45 +2348,6 @@ def resolve_tts_backend(
     )
 
 
-_TRANSFORMERS_TTS_CACHE: dict[str, tuple[Any, Any, Any, int, str]] = {}
-
-
-def synthesize_transformers_tts(text: str, output: Path, model_path: str, device: str) -> Path:
-    cache_key = f"{model_path}:{device}"
-    if cache_key not in _TRANSFORMERS_TTS_CACHE:
-        try:
-            import torch
-            from transformers import AutoTokenizer, VitsModel
-        except ImportError as exc:
-            raise RuntimeError("Transformers TTS requires the Conda pytorch and transformers packages.") from exc
-        dtype = torch.float32
-        model = VitsModel.from_pretrained(
-            model_path,
-            local_files_only=True,
-            torch_dtype=dtype,
-        ).to(device)
-        model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-        _TRANSFORMERS_TTS_CACHE[cache_key] = (
-            torch,
-            tokenizer,
-            model,
-            int(model.config.sampling_rate),
-            device,
-        )
-    torch, tokenizer, model, sample_rate, model_device = _TRANSFORMERS_TTS_CACHE[cache_key]
-    inputs = tokenizer(text, return_tensors="pt").to(model_device)
-    with torch.inference_mode():
-        waveform = model(**inputs).waveform.squeeze().detach().float().cpu().numpy()
-    pcm = (np.clip(waveform, -1.0, 1.0) * 32767.0).astype(np.int16)
-    with wave.open(str(output), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(sample_rate)
-        handle.writeframes(pcm.tobytes())
-    return output
-
-
 def synthesize_text(
     text: str,
     output_stem: Path,
@@ -2387,6 +2356,10 @@ def synthesize_text(
     piper_model: str | None,
     device: str,
 ) -> Path:
+    if backend == "http":
+        output = output_stem.with_suffix(".wav")
+        synthesize_remote_tts(executable, text, "en", output)
+        return output
     if backend == "transformers":
         return synthesize_transformers_tts(
             text,
@@ -2550,13 +2523,14 @@ def synthesize_decisions(
     device: str,
     ffprobe: str,
     *,
+    tts_url: str | None = None,
     rewrite_for_time: Callable[[int, str, float, float], str | None] | None = None,
     decision_index_offset: int = 0,
     fallback_speech: Sequence[Interval] = (),
     existing_cues: Sequence[Decision] = (),
 ) -> tuple[str, list[Decision]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model)
+    backend, executable = resolve_tts_backend(requested_backend, piper_model, transformers_model, tts_url)
     occupied_by_gap: dict[tuple[float, float], list[Interval]] = {}
     priority = sorted(
         enumerate(decisions, start=decision_index_offset + 1),
@@ -2896,9 +2870,10 @@ def parse_args() -> argparse.Namespace:
                         help=f"CPU thinking budget when the editor is enabled (default: {DEFAULT_REASONING_TOKENS}; 0 disables it)")
     parser.add_argument(
         "--tts-backend",
-        choices=["auto", "transformers", "piper", "espeak-ng", "say"],
+        choices=["auto", "transformers", "piper", "espeak-ng", "say", "http"],
         default="auto",
     )
+    parser.add_argument("--tts-url", help="Internal speech service URL for the http backend")
     parser.add_argument("--tts-model", help="Local Transformers VITS TTS model directory")
     parser.add_argument("--piper-model", help="Local Piper .onnx voice model")
     parser.add_argument("--minimum-gap", type=float, default=1.5)
@@ -3050,6 +3025,8 @@ def write_dialogue_artifacts(work_dir: Path, dialogue: dict) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.tts_backend == "http" and not args.tts_url:
+        raise ValueError("--tts-backend http requires --tts-url.")
     if args.smolvlm_max_new_tokens < 1:
         raise ValueError("--smolvlm-max-new-tokens must be positive")
     if args.ad_preparer_reasoning_tokens is None:
@@ -3318,10 +3295,12 @@ def main() -> None:
         if args.tts_backend == "transformers" or (args.tts_backend == "auto" and args.tts_model)
         else "cpu"
     )
+    tts_service = {"synthesis_service": "tts"} if args.tts_backend == "http" else {}
     with profiler.stage(
         "tts",
         requested_method=args.tts_backend,
         compute_device=tts_compute_device,
+        **tts_service,
     ) as stage:
         tts_backend, decisions = synthesize_decisions(
             decisions,
@@ -3331,7 +3310,7 @@ def main() -> None:
             args.tts_model,
             device,
             ffprobe,
-            rewrite_for_time=rewrite_for_time if generate_cue else None,
+            tts_url=args.tts_url, rewrite_for_time=rewrite_for_time if generate_cue else None,
         )
         stage.update(
             method=tts_backend,
@@ -3376,10 +3355,12 @@ def main() -> None:
             )
             prepared.extend(extra_prepared)
             prepared_by_index.update((row["decision_index"], row) for row in extra_prepared)
-        with profiler.stage("scene_fallback_tts", method=tts_backend, compute_device=tts_compute_device) as stage:
+        with profiler.stage("scene_fallback_tts", method=tts_backend, compute_device=tts_compute_device,
+                            **tts_service) as stage:
             synthesize_decisions(
                 fallback, work_dir / "narration", args.tts_backend, args.piper_model, args.tts_model, device, ffprobe,
-                rewrite_for_time=rewrite_for_time if generate_cue else None, decision_index_offset=offset,
+                tts_url=args.tts_url, rewrite_for_time=rewrite_for_time if generate_cue else None,
+                decision_index_offset=offset,
                 fallback_speech=speech, existing_cues=decisions,
             )
             stage.update(

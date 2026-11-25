@@ -28,17 +28,20 @@ class Profile:
 
     def ad_args(
         self, models: Path, *, vlm: Path | None = None, tts: Path | None = None,
-        mmproj: Path | None = None, executable: str | None = None, evidence_frames: int | None = None,
-        evidence_max_edge: int | None = None, followups: int | None = None,
+        tts_url: str | None = None, mmproj: Path | None = None, executable: str | None = None,
+        evidence_frames: int | None = None, evidence_max_edge: int | None = None, followups: int | None = None,
     ) -> list:
         vlm = vlm or models / self.vlm
-        tts = tts or models / self.tts
-        require_file(tts / "config.json")
         args = ["--visual-backend", self.name, "--vlm-model", vlm,
-                "--tts-backend", "transformers", "--tts-model", tts,
                 "--evidence-frames", str(self.evidence_frames if evidence_frames is None else evidence_frames),
                 "--evidence-max-edge", str(self.evidence_max_edge if evidence_max_edge is None else evidence_max_edge),
                 "--event-followups", str(self.followups if followups is None else followups)]
+        if tts_url:
+            args.extend(["--tts-backend", "http", "--tts-url", tts_url])
+        else:
+            tts = tts or models / self.tts
+            require_file(tts / "config.json")
+            args.extend(["--tts-backend", "transformers", "--tts-model", tts])
         if self.name == "qwen3vl":
             mmproj = mmproj or models / QWEN3_MMPROJ
             require_file(vlm)

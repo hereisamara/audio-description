@@ -262,7 +262,9 @@ function updateControls() {
   el("translate-ad").title = capabilities.thai_translation ? "" : "Requires a local Qwen3 translation model";
   el("generate-audio").disabled = generatingNarration || !source || !capabilities.ffmpeg || !voice ||
     !tracks[narrationTrack].length;
-  el("generate-audio").title = voice ? "" : "Install a local " + narrationLanguages[language][1] + " voice";
+  el("generate-audio").title = voice || (capabilities.tts_service ?
+    "The " + narrationLanguages[language][1] + " voice is unavailable in the TTS service" :
+    "Install a local " + narrationLanguages[language][1] + " voice");
   el("download-audio").disabled = !selected;
   el("revoice").disabled = !!selected || !source || !capabilities.voice || !tracks.ad.length ||
     !(originalSource || (media?.tracks.some(item => item.ad) && media?.tracks.some(item => !item.ad)));

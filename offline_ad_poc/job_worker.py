@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-model", type=Path, default=os.environ.get("VLM_MODEL") or None)
     parser.add_argument("--vlm-mmproj", type=Path, default=os.environ.get("VLM_MMPROJ") or None)
     parser.add_argument("--vlm-executable", default=os.environ.get("VLM_EXECUTABLE") or None)
+    parser.add_argument("--tts-url", default=os.environ.get("TTS_URL") or None)
     parser.add_argument("--tts-model", type=Path, default=os.environ.get("TTS_MODEL") or None)
     parser.add_argument("--ad-preparer-model", type=Path, default=os.environ.get("AD_PREPARER_MODEL") or None)
     parser.add_argument("--ad-preparer-executable", default=os.environ.get("AD_PREPARER_EXECUTABLE") or "llama-completion")
@@ -108,7 +109,7 @@ class Worker:
         if args.role == "whisper":
             return profile.asr_args(args.models, args.asr_model)
         return profile.ad_args(
-            args.models, vlm=args.vlm_model, tts=args.tts_model, mmproj=args.vlm_mmproj,
+            args.models, vlm=args.vlm_model, tts=args.tts_model, tts_url=args.tts_url, mmproj=args.vlm_mmproj,
             executable=args.vlm_executable, evidence_frames=args.evidence_frames,
             evidence_max_edge=args.evidence_max_edge, followups=args.event_followups,
         )

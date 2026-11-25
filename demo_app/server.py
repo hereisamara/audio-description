@@ -19,6 +19,11 @@ import threading
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from offline_ad_poc.tts_client import TtsError, available_voices, synthesize as synthesize_remote_tts
+
 
 WEB = Path(__file__).resolve().parent / "web"
 ARTIFACTS = {
@@ -106,9 +111,9 @@ def voice_engine(language: str = "en") -> str | None:
 
 
 def narration_mix(rows: list, directory: Path, audio: int, first_input: int,
-                  language: str = "en", *, fit_speed: bool = False) -> tuple[list, str]:
-    engine = voice_engine(language)
-    if not engine:
+                  language: str = "en", *, fit_speed: bool = False, tts_url: str | None = None) -> tuple[list, str]:
+    engine = voice_engine(language) if not tts_url else None
+    if not tts_url and not engine:
         raise ValueError("Install a Thai system voice in macOS Read & Speak." if language == "th"
                          else "Revoicing needs an English macOS voice or eSpeak NG.")
     if not 0 < len(rows) <= 100:
@@ -122,16 +127,19 @@ def narration_mix(rows: list, directory: Path, audio: int, first_input: int,
         text = " ".join(row["text"].split())
         if not text:
             raise ValueError(f"AD cue {index + 1} is empty.")
-        stem = directory / f"cue-{index:03d}.aiff"
-        if engine.startswith("macOS "):
-            cue_file = directory / f"cue-{index:03d}.txt"
-            cue_file.write_text(text, encoding="utf-8")
-            command("/usr/bin/say", "-v", engine.removeprefix("macOS "), "-o", stem, "-f", cue_file)
+        stem = directory / f"cue-{index:03d}.wav"
+        if tts_url:
+            duration = synthesize_remote_tts(tts_url, text, language, stem)
         else:
-            stem = stem.with_suffix(".wav")
-            command("espeak-ng", "-v", "en-us", "-w", stem, "--", text)
-        duration = float(command("ffprobe", "-v", "error", "-show_entries", "format=duration",
-                                 "-of", "default=nw=1:nk=1", stem))
+            if engine.startswith("macOS "):
+                stem = stem.with_suffix(".aiff")
+                cue_file = directory / f"cue-{index:03d}.txt"
+                cue_file.write_text(text, encoding="utf-8")
+                command("/usr/bin/say", "-v", engine.removeprefix("macOS "), "-o", stem, "-f", cue_file)
+            else:
+                command("espeak-ng", "-v", "en-us", "-w", stem, "--", text)
+            duration = float(command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                     "-of", "default=nw=1:nk=1", stem))
         slot = row["end"] - row["start"]
         speed = max(1.0, duration / slot)
         if speed > (1.5 if fit_speed else 1.0):
@@ -154,14 +162,15 @@ def narration_mix(rows: list, directory: Path, audio: int, first_input: int,
     return inputs, ";".join(filters)
 
 
-def render_narration(video: Path, destination: Path, audio: int, rows: list, language: str) -> None:
+def render_narration(video: Path, destination: Path, audio: int, rows: list, language: str,
+                     *, tts_url: str | None = None) -> None:
     subtitle_text(rows)
     tracks = audio_streams(video)
     if type(audio) is not int or not 0 <= audio < len(tracks) or tracks[audio]["ad"]:
         raise ValueError("Narration needs the original soundtrack.")
     with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
         directory = Path(temporary)
-        inputs, graph = narration_mix(rows, directory, audio, 1, language, fit_speed=True)
+        inputs, graph = narration_mix(rows, directory, audio, 1, language, fit_speed=True, tts_url=tts_url)
         output = directory / "mix.m4a"
         command("ffmpeg", "-nostdin", "-v", "error", "-i", video, *inputs,
                 "-filter_complex", graph, "-map", "[mix]", "-c:a", "aac", "-b:a", "128k",
@@ -184,7 +193,7 @@ def combined_ad_rows(english: list, thai: list) -> list:
 
 def render(video: Path, destination: Path, audio: int, captions: dict, revoice: bool = False,
            narration: Path | None = None, language: str | None = None,
-           alternate_narration: tuple[Path, str] | None = None) -> None:
+           alternate_narration: tuple[Path, str] | None = None, *, tts_url: str | None = None) -> None:
     tracks = audio_streams(video)
     if type(audio) is not int or not 0 <= audio < len(tracks):
         raise ValueError("Select an available audio track.")
@@ -215,7 +224,9 @@ def render(video: Path, destination: Path, audio: int, captions: dict, revoice: 
         if revoice:
             if tracks[audio]["ad"]:
                 raise ValueError("Select the original soundtrack to revoice the edited AD.")
-            speech_inputs, graph = narration_mix(captions.get("ad", []), Path(temporary), audio, len(labels) + 1)
+            speech_inputs, graph = narration_mix(
+                captions.get("ad", []), Path(temporary), audio, len(labels) + 1, tts_url=tts_url,
+            )
             args.extend((*speech_inputs, "-filter_complex", graph))
             selected_audio = "[mix]"
         args.extend(("-map", "0:v:0", "-map", selected_audio))
@@ -243,13 +254,14 @@ class Demo(ThreadingHTTPServer):
     def __init__(self, address, data: Path, models: Path | None, repository: Path, example: Path | None,
                  profile: str = "auto", preparer_args: tuple[str | Path, ...] = (),
                  translator: tuple[Path, str] | None = None, split_workers: bool = False,
-                 allowed_hosts: tuple[str, ...] = ()):
+                 allowed_hosts: tuple[str, ...] = (), tts_url: str | None = None):
         super().__init__(address, Handler)
         self.data = data
         self.models = models
         self.profile = profile
         self.preparer_args = preparer_args
         self.translator = translator
+        self.tts_url = tts_url
         self.repository = repository
         self.example = example
         self.allowed_hosts = {"localhost", "127.0.0.1", *(host.casefold() for host in allowed_hosts)}
@@ -272,12 +284,26 @@ class Demo(ThreadingHTTPServer):
                      for key, env in (("vlm", "VLM_MODEL"), ("mmproj", "VLM_MMPROJ"), ("tts", "TTS_MODEL"))}
         asr = Path(value) if (value := os.environ.get("ASR_MODEL")) else None
         return [*profile.asr_args(self.models, asr), *profile.ad_args(
-            self.models, **overrides, executable=os.environ.get("VLM_EXECUTABLE") or None,
+            self.models, **overrides, tts_url=self.tts_url, executable=os.environ.get("VLM_EXECUTABLE") or None,
         )]
 
+    def voices(self) -> dict[str, str]:
+        if self.tts_url:
+            return available_voices(self.tts_url)
+        return {language: voice for language in ("en", "th") if (voice := voice_engine(language))}
+
     def capabilities(self) -> dict:
+        tts_detail = None
+        try:
+            voices = self.voices()
+        except TtsError as error:
+            voices = {}
+            tts_detail = str(error)
+        if self.tts_url and "en" not in voices and not tts_detail:
+            tts_detail = "Stage the English checkpoint in the TTS container."
         report = {"host": socket.gethostname(), "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
-                  "voice": voice_engine(), "thai_voice": voice_engine("th"),
+                  "voice": voices.get("en"), "thai_voice": voices.get("th"),
+                  "tts_service": bool(self.tts_url), "tts_detail": tts_detail,
                   "thai_translation": bool(self.translator),
                   "models": False, "cuda": False, "worker": False, "example": self.example is not None,
                   "profile": self.profile, "ad_preparer": bool(self.preparer_args)}
@@ -285,13 +311,13 @@ class Demo(ThreadingHTTPServer):
             roles = self.job_store.active_workers()
             ready = {"whisper", "ad"} <= roles.keys()
             report.update(
-                split_workers=True, worker=ready and report["ffmpeg"],
+                split_workers=True, worker=ready and report["ffmpeg"] and not tts_detail,
                 models=ready, cuda=any(worker["cuda"] for worker in roles.values()),
                 workers={role: {"host": worker["host"], "cuda": bool(worker["cuda"])}
                          for role, worker in roles.items()},
                 profile=roles.get("ad", {}).get("profile", self.profile),
                 ad_preparer=bool(roles.get("ad", {}).get("preparer")),
-                detail="Split workers ready." if ready else "Waiting for Whisper and AD workers.",
+                detail=tts_detail or ("Split workers ready." if ready else "Waiting for Whisper and AD workers."),
             )
             return report
         if not self.models:
@@ -312,8 +338,8 @@ class Demo(ThreadingHTTPServer):
                 errors[device] = str(error)
         report["cuda"] = cuda and "cuda" not in errors
         report["models"] = report["cuda"] or "cpu" not in errors
-        report["worker"] = report["models"] and report["ffmpeg"]
-        report["detail"] = "; ".join(errors.values()) or "Local checkpoints ready."
+        report["worker"] = report["models"] and report["ffmpeg"] and not tts_detail
+        report["detail"] = tts_detail or "; ".join(errors.values()) or "Local checkpoints ready."
         return report
 
     def run_job(self, job_id: str, video: Path, device: str) -> None:
@@ -631,21 +657,27 @@ class Handler(SimpleHTTPRequestHandler):
                             alternate = (other, alternate_language)
                     render(video, directory / name, options["audio"], options.get("captions", {}),
                            revoice=options.get("revoice") is True, narration=narration, language=language,
-                           alternate_narration=alternate)
+                           alternate_narration=alternate, tts_url=self.server.tts_url)
                     self.reply({"url": f"/result/{parts[2]}/{name}"})
                 elif parts[3] == "narration":
                     language = options["language"]
                     if language not in {"en", "th"}:
                         raise ValueError("Select English or Thai.")
                     name = f"narration-{language}.m4a"
-                    render_narration(video, directory / name, options["audio"], options["cues"], language)
-                    self.reply({"url": f"/result/{parts[2]}/{name}?{uuid4().hex}", "voice": voice_engine(language)})
+                    voice = self.server.voices().get(language)
+                    if self.server.tts_url and not voice:
+                        raise TtsError(f"The {language} voice checkpoint is unavailable.")
+                    render_narration(video, directory / name, options["audio"], options["cues"], language,
+                                     tts_url=self.server.tts_url)
+                    self.reply({"url": f"/result/{parts[2]}/{name}?{uuid4().hex}", "voice": voice})
                 elif parts[3] == "generate":
                     self.submit(video, options, parts[2])
                 else:
                     self.send_error(404)
             else:
                 self.send_error(404)
+        except TtsError as error:
+            self.reply({"error": str(error)}, 503)
         except (ValueError, TypeError, KeyError, AttributeError, OSError, subprocess.TimeoutExpired) as error:
             self.reply({"error": str(error)}, 400)
 
@@ -707,6 +739,7 @@ if __name__ == "__main__":
     parser.add_argument("--repository", type=Path, default=WEB.parents[1])
     parser.add_argument("--example", type=Path)
     parser.add_argument("--split-workers", action="store_true", help="Use the shared Whisper and AD job database")
+    parser.add_argument("--tts-url", default=os.environ.get("TTS_URL") or None, help="Internal speech service URL")
     parser.add_argument("--allowed-host", action="append", default=[], help="Additional trusted HTTP host name")
     args = parser.parse_args()
     if not __package__ and (args.models or args.split_workers):
@@ -743,7 +776,7 @@ if __name__ == "__main__":
     server = Demo(
         (args.host, args.port), args.data.resolve(), args.models.resolve() if args.models else None,
         args.repository.resolve(), args.example.resolve() if args.example else None, args.profile,
-        preparer_args, translator, args.split_workers, tuple(args.allowed_host),
+        preparer_args, translator, args.split_workers, tuple(args.allowed_host), args.tts_url,
     )
     print(f"AD Review Studio at http://{args.host}:{server.server_port}", flush=True)
     server.serve_forever()

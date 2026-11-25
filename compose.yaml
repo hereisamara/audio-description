@@ -23,6 +23,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${STUDIO_PORT:-7860}:7860"
+    environment:
+      TTS_URL: http://tts:7861
+    depends_on:
+      - tts
     volumes:
       - job-data:/data
 
@@ -36,6 +40,8 @@ services:
 
   ad-maker:
     <<: *worker
+    depends_on:
+      - tts
     command: ["python", "-m", "offline_ad_poc.job_worker", "ad", "--data", "/data", "--models", "/models", "--cpu-only"]
     environment:
       <<: *worker-cpu-environment
@@ -43,7 +49,7 @@ services:
       VLM_MODEL: ${VLM_MODEL:-}
       VLM_MMPROJ: ${VLM_MMPROJ:-}
       VLM_EXECUTABLE: ${VLM_EXECUTABLE:-}
-      TTS_MODEL: ${TTS_MODEL:-}
+      TTS_URL: http://tts:7861
       AD_PREPARER: ${AD_PREPARER:-auto}
       AD_PREPARER_EXECUTABLE: ${AD_PREPARER_EXECUTABLE:-}
       AD_PREPARER_MODEL: ${AD_PREPARER_MODEL:-}
@@ -51,6 +57,20 @@ services:
       EVIDENCE_FRAMES: ${EVIDENCE_FRAMES:-}
       EVIDENCE_MAX_EDGE: ${EVIDENCE_MAX_EDGE:-}
       EVENT_FOLLOWUPS: ${EVENT_FOLLOWUPS:-}
+
+  tts:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+      target: tts
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    environment:
+      <<: *worker-cpu-environment
+      TTS_MODEL_EN: ${TTS_MODEL_EN:-/models/mms-tts-eng-local}
+      TTS_MODEL_TH: ${TTS_MODEL_TH:-/models/mms-tts-tha}
 
 volumes:
   job-data:
