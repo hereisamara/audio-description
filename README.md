@@ -127,7 +127,9 @@ hf download facebook/mms-tts-eng --local-dir models/mms-tts-eng
 docker compose -f compose.yaml -f compose.cuda.yaml up --build -d
 ```
 
-For the worker contracts, API, and standalone pipeline commands, see the
-[worker integration guide](docs/worker-integration.md). The
-[Lanta POC branch](https://github.com/hereisamara/audio-description/tree/lanta-poc)
+For endpoints, JSON types, and request examples, see the [API reference](docs/api.md).
+For standalone commands and replacing a worker, see the
+[worker integration guide](docs/worker-integration.md).
+
+The [Lanta POC branch](https://github.com/hereisamara/audio-description/tree/lanta-poc)
 contains the Slurm launchers and research benchmarks.

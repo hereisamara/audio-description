@@ -36,7 +36,8 @@ flowchart LR
 Studio, Whisper, and AD Maker run as three services. The workers pick
 up jobs through `/data/studio-jobs.sqlite3`. They share the mounted video
 and artifact files on the same host. Studio provides the HTTP interface
-for browsers and other containers.
+for browsers and other containers. See the [API reference](api.md) for
+HTTP requests, response types, and the worker interface.
 
 | Worker | Job stage | Reads | Publishes |
 | --- | --- | --- | --- |
