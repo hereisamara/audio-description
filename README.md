@@ -40,9 +40,14 @@ English cues. For Thai audio, add, import, or translate Thai cues before
 selecting **Generate AD audio**.
 
 The initial build and downloads need internet access. Inference uses the
-staged models offline. Compose stores uploads, job state, and results in
-the local `job-data` volume. `docker compose stop` stops the services and
-keeps the volume.
+staged models offline.
+
+## Docker specifications
+
+- All four services use Linux-based Micromamba images. On macOS, Docker Desktop runs them in a Linux VM.
+- The default Compose profile runs on CPU. The CUDA override runs Whisper and AD Maker on an x86-64 Linux host with an NVIDIA GPU. Studio and TTS stay on CPU.
+- Studio is published at `127.0.0.1:7860` by default. TTS is internal to the Compose network on port `7861`.
+- Model checkpoints mount read-only at `/models`. The `job-data` volume persists uploads, SQLite job state, and results across `docker compose stop`.
 
 ## How the containers interact
 
