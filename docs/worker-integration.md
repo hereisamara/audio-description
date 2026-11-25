@@ -8,6 +8,7 @@ flowchart LR
     api["Studio API"]
     whisper["Whisper worker"]
     adMaker["AD Maker worker"]
+    tts["TTS service (CPU)"]
 
     subgraph volume["Shared job-data volume mounted at /data"]
         db[("SQLite job queue and dialogue")]
@@ -27,22 +28,25 @@ flowchart LR
     db -->|"AD job claim and saved dialogue and gaps"| adMaker
     uploads -->|"Same original video"| adMaker
     analysis -->|"Reuse WAV"| adMaker
+    adMaker <-->|"English cue text and WAV response"| tts
+    api <-->|"English or Thai edited cue text and WAV response"| tts
     adMaker -->|"Mark finished and record output directory"| db
     adMaker -->|"Write review and narration files"| results
     uploads -->|"Read original for playback"| api
     results -->|"Read finished files for playback"| api
 ```
 
-Studio, Whisper, and AD Maker run as three services. The workers pick
-up jobs through `/data/studio-jobs.sqlite3`. They share the mounted video
+Studio, Whisper, and AD Maker share the writable job volume. Whisper
+and AD Maker pick up jobs through `/data/studio-jobs.sqlite3`. They share the mounted video
 and artifact files on the same host. Studio provides the HTTP interface
 for browsers and other containers. See the [API reference](api.md) for
-HTTP requests, response types, and the worker interface.
+HTTP requests, response types, and the worker interfaces.
 
 | Worker | Job stage | Reads | Publishes |
 | --- | --- | --- | --- |
 | `whisper` | `whisper` | `media_id`, selected device, original MP4 | Version 1 dialogue payload in SQLite, plus `work/analysis-audio.wav` in its attempt directory |
-| `ad-maker` | `ad` | Same MP4, saved dialogue JSON and analysis WAV, selected device | Finished result directory in SQLite, plus the described MP4, subtitles, narration plan and WAVs |
+| `ad-maker` | `ad` | Same MP4, saved dialogue JSON and analysis WAV, selected device, WAV clips from TTS | Finished result directory in SQLite, plus the described MP4, subtitles, narration plan and WAVs |
+| `tts` | HTTP request | Cue text, an English or Thai language code, and local checkpoints | Mono PCM WAV bytes and duration |
 
 ## Whisper worker contract
 
@@ -136,8 +140,9 @@ Sort cues by `start`. Use final placement times after synthesis.
 `/result/<job_id>/` over HTTP. Use the `ad-NNN-try-N.wav` naming convention
 for Studio to serve the files. The overlap flags refer to the supplied
 speech mask. A job with zero cues can publish `"cues": []` and an MP4 with the
-original audio. The current AD Maker already runs TTS. An external TTS
-consumer can reuse each cue's `start`, `end`, and `text`.
+original audio. In Compose, AD Maker obtains each clip from the TTS
+service before final placement. The final narration plan stays a
+portable list of cues and WAV paths.
 
 If you keep the bundled [runner](../offline_ad_poc/job_worker.py), have
 your AD process emit `work/ad-decisions.json`. Its rows with
@@ -146,6 +151,20 @@ your AD process emit `work/ad-decisions.json`. Its rows with
 `dialogue_overlap_seconds`. Set `tts_path` to the absolute path of the
 generated WAV inside the attempt's `work/narration/`. The runner derives
 the versioned narration plan from those rows.
+
+## TTS service contract
+
+TTS loads English MMS-TTS and Thai MMS-TTS checkpoints on CPU and
+keeps loaded models in the service process. AD Maker sends English cue
+drafts as it checks placement. Studio sends English or Thai cue text
+when it generates edited narration. The caller retains the cue times,
+soundtrack, and mix. The service returns speech clips over HTTP.
+
+To replace synthesis, provide an image on the Compose network under the
+`tts` service name and listen on port 7861. Implement
+`GET /v1/voices` and `POST /v1/synthesize` using the [TTS service API](api.md#tts-service-api).
+The replacement can pick a different engine. Keep the published WAV
+format so both callers can measure and mix the clips.
 
 ## Run or replace one worker
 
@@ -178,7 +197,10 @@ python -c 'import sys; from pathlib import Path; from offline_ad_poc.job_worker 
 ```
 
 The direct commands leave the files in `$RUN`. The runner adds database
-publication in the Compose deployment.
+publication in the Compose deployment. To use a running TTS service from
+the direct pipeline command, replace the Transformers TTS flags with
+`--tts-backend http --tts-url http://127.0.0.1:7861` and run
+`python -m offline_ad_poc.tts_service` separately with model paths.
 
 ### Integrate a replacement container
 

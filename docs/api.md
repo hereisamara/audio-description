@@ -11,7 +11,8 @@ The API is intended for local use and has no authentication. If you set
 | --- | --- | --- |
 | `studio` | HTTP with JSON, MP4 uploads, and file downloads | Upload media, submit jobs, read dialogue, and stream results. |
 | `whisper` | SQLite job queue and files on `/data` | Submit through Studio. Read transcript and gaps through Studio, or implement the Whisper contract when replacing the worker. |
-| `ad-maker` | SQLite job queue and files on `/data` | The Whisper result queues this stage. Read the result manifest through Studio, or implement the AD Maker contract when replacing the worker. |
+| `ad-maker` | SQLite and shared files, plus internal TTS calls | The Whisper result queues this stage. Read the result manifest through Studio, or implement the AD Maker contract when replacing the worker. |
+| `tts` | Internal HTTP at `http://tts:7861` | Send English or Thai text and receive a WAV clip. |
 
 ## Submit a job
 
@@ -25,10 +26,14 @@ curl -fsS "$base/api/capabilities" | jq '{worker, profile, workers}'
 
 Check `worker: true` before submission. `GET /api/capabilities` returns
 a JSON object. In Compose, `split_workers` is `true`, `worker` (boolean)
-indicates that both worker heartbeats are current and FFmpeg is available,
-`cuda` (boolean) indicates at least one CUDA worker, and `profile` is a
-string. `workers` maps the active roles `whisper` and `ad` to objects
+indicates that both worker heartbeats are current, FFmpeg is available,
+and the TTS service reports an English voice. `cuda` (boolean) indicates
+at least one CUDA worker, and `profile` is a string. `workers` maps the active roles `whisper` and `ad` to objects
 with `host` (string) and `cuda` (boolean).
+In Compose, `tts_service` is `true`. `voice` and `thai_voice` are the
+English and Thai voice names (string or null). `tts_detail` is a
+readiness message (string or null). A missing Thai voice only disables
+Thai audio generation.
 
 ### Upload
 
@@ -152,13 +157,49 @@ with numeric seconds and string text.
 | Route | Request | Response |
 | --- | --- | --- |
 | `POST /api/media/{media_id}/render` | `audio` (audio track index), optional `captions` object with cue arrays under `ad`, `adThai`, and `dialogue`. | `{"url":"..."}` for the exported MP4. |
-| `POST /api/media/{media_id}/narration` | `audio` (original soundtrack index), `language` (`"en"` or `"th"`), and `cues` (array). Requires an available local voice reported by `voice` or `thai_voice` in capabilities. | `{"url":"...","voice":"..."}` for the generated audio mix. |
+| `POST /api/media/{media_id}/narration` | `audio` (original soundtrack index), `language` (`"en"` or `"th"`), and `cues` (array). Requires a voice reported by `voice` or `thai_voice` in capabilities. | `{"url":"...","voice":"..."}` for the generated audio mix. |
 | `POST /api/translate-ad` | `cues` (1 to 100 English AD rows). Requires `thai_translation: true` in capabilities. | `{"cues":[...]}` with translated cue text and matching timings. |
 
-For rendering, `revoice: true` can synthesize the English cues over the
+In Compose, Studio sends cue text to TTS for each new mix or revoice.
+English and Thai narration requests take 1 to 100 cues in the requested
+language. Studio returns HTTP 503 if TTS cannot synthesize the requested
+cue, including when its checkpoint or service is unavailable. Translation
+is a separate step. It returns Thai text that can be sent to the
+narration endpoint.
+
+For rendering, `revoice: true` synthesizes the English cues over the
 original audio. When a mix is already generated for the same media ID,
 pass `narration_language` and optionally `alternate_narration_language`
 (`"en"` or `"th"`) to export one or both mixes.
+
+## TTS service API
+
+Use `http://tts:7861` from within the Compose network. Studio and AD Maker
+use this URL via `TTS_URL`. The TTS port is internal to Compose. The service
+uses CPU and has no shared job volume.
+
+| Route | Input | Success response |
+| --- | --- | --- |
+| `GET /v1/voices` | No body | HTTP 200 JSON such as `{"voices":{"en":"mms-tts-eng","th":"mms-tts-tha"}}`. The map contains the languages with staged checkpoint files. |
+| `POST /v1/synthesize` | JSON with `text` (non-blank Unicode string, 1–3000 characters) and `language` (`"en"` or `"th"`). Send `Content-Type: application/json`, up to 64 KiB. | HTTP 200 with `Content-Type: audio/wav` (mono signed 16-bit PCM), `X-TTS-Voice` (voice name), and `X-TTS-Duration-Seconds` (decimal seconds). The sample rate is in the WAV header. |
+
+From a container on the Compose network with `curl` installed:
+
+```bash
+curl -fsS http://tts:7861/v1/voices
+curl -fsS http://tts:7861/v1/synthesize -H 'Content-Type: application/json' \
+  --data '{"text":"A frog rests on a leaf.","language":"en"}' -o english.wav
+curl -fsS http://tts:7861/v1/synthesize -H 'Content-Type: application/json' \
+  --data '{"text":"กบเกาะอยู่บนใบไม้","language":"th"}' -o thai.wav
+```
+
+Errors use JSON `{"error":"message"}`. HTTP 400 indicates an invalid
+request, 404 an unknown route, 503 a missing checkpoint for that
+language, and 500 a synthesis failure. Calls return one untimed voice
+clip. Studio or AD Maker applies timing and mixes the clip with the video.
+`TTS_MODEL_EN` and `TTS_MODEL_TH` point to the model directories **inside**
+the TTS container. The client allows up to 120 seconds per synthesis
+call and 16 MiB for a WAV response.
 
 ## Work directly with a worker container
 

@@ -18,7 +18,10 @@ git clone https://github.com/hereisamara/audio-description.git
 cd audio-description
 
 hf download openai/whisper-tiny.en --local-dir models/whisper-tiny.en
-hf download facebook/mms-tts-eng --local-dir models/mms-tts-eng-local
+hf download facebook/mms-tts-eng config.json tokenizer_config.json special_tokens_map.json vocab.json model.safetensors \
+  --local-dir models/mms-tts-eng-local
+hf download facebook/mms-tts-tha config.json tokenizer_config.json special_tokens_map.json vocab.json model.safetensors \
+  --local-dir models/mms-tts-tha
 hf download Qwen/Qwen3-VL-2B-Instruct-GGUF \
   Qwen3VL-2B-Instruct-Q4_K_M.gguf mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf \
   --local-dir models/qwen3-vl-2b-instruct-gguf
@@ -31,6 +34,10 @@ with an audio stream, and select **Start job**. Keep **Auto** for the default
 profile. Choose **Inspect dialogue and gaps** as soon as Whisper finishes.
 Open completed jobs under **Recent jobs** and use the right panel to edit cues
 or export the result. Use **Import run** to review results from another host.
+In the audio panel, choose English or Thai and select **Generate AD audio**
+after adding or importing cues in that language. Automatic jobs draft
+English cues. For Thai audio, add, import, or translate Thai cues before
+selecting **Generate AD audio**.
 
 The initial build and downloads need internet access. Inference uses the
 staged models offline. Compose stores uploads, job state, and results in
@@ -39,11 +46,12 @@ keeps the volume.
 
 ## How the containers interact
 
-The browser talks to `studio` over HTTP. All three containers mount
+The browser talks to Studio over HTTP. Studio, Whisper, and AD Maker mount
 `job-data` at `/data`. SQLite in that volume holds the job queue and
 dialogue records. The original video, analysis WAV, and finished artifacts
-are files on the same volume. Both workers load checkpoints from the
-read-only `/models` mount.
+are files on the same volume. The TTS container loads English and Thai
+MMS checkpoints from `/models` and serves WAV clips on the Compose
+network. Whisper and AD Maker also load models from read-only mounts.
 
 ```mermaid
 sequenceDiagram
@@ -53,6 +61,7 @@ sequenceDiagram
     participant Files as Files on job-data
     participant Whisper as whisper
     participant AD as ad-maker
+    participant TTS as tts
 
     Browser->>Studio: POST /api/media with MP4 bytes
     Studio->>Files: Save source.mp4
@@ -72,6 +81,8 @@ sequenceDiagram
     AD->>DB: Claim an AD job and load its Whisper result
     DB-->>AD: Source path, analysis WAV path, dialogue, gaps, and device
     Files-->>AD: Original MP4 and analysis WAV
+    AD->>TTS: POST /v1/synthesize with each English draft cue
+    TTS-->>AD: WAV bytes and actual duration
     AD->>Files: Save described MP4, WebVTT, narration plan, and cue WAVs
     AD->>DB: Mark the job finished and record the result directory
 
@@ -81,6 +92,12 @@ sequenceDiagram
     Browser->>Studio: GET /result/{job_id}/... with an optional Range header
     Studio->>Files: Read the requested file or byte range
     Studio-->>Browser: File bytes, with HTTP 206 for a requested range
+
+    Browser->>Studio: POST /api/media/{media_id}/narration with edited cues and language
+    Studio->>TTS: POST /v1/synthesize with each English or Thai cue
+    TTS-->>Studio: WAV bytes and actual duration
+    Studio->>Files: Mix with original soundtrack and save M4A
+    Studio-->>Browser: Narration URL and voice name
 ```
 
 - **Studio** saves the uploaded MP4 once. The browser polls the job endpoint
@@ -90,10 +107,13 @@ sequenceDiagram
   dialogue and queuing AD happens in one transaction, so AD Maker picks up
   the job with its input ready.
 - **AD Maker** combines the original frames with the saved dialogue and gaps.
-  It plans cues, runs the available cue editor and MMS-TTS, then mixes the
-  narration into a selectable track. It publishes the result directory
-  after writing the files. Studio serves MP4s and cue WAVs by byte range
-  when the browser requests partial content.
+  It plans cues, runs the available cue editor, and sends the text to TTS.
+  It uses the returned clip durations to place cues, then mixes the
+  narration into a selectable track and publishes the result directory.
+  Studio serves MP4s and cue WAVs by byte range.
+- **TTS** takes text and a language code and returns a mono WAV clip. It
+  runs on CPU in both Compose profiles. Studio calls the same service
+  when you generate English or Thai audio from reviewed cues.
 
 Click a VLM marker to inspect the saved prompt, selected frames, and reply.
 The timeline also shows shots, scenes, dialogue, and placed cues. Review the
@@ -122,7 +142,6 @@ Compose file uses the Qwen3-VL-2B CPU profile.
 ```bash
 hf download openai/whisper-small.en --local-dir models/whisper-small.en-transformers
 hf download Qwen/Qwen3-VL-8B-Instruct --local-dir models/Qwen3-VL-8B-Instruct
-hf download facebook/mms-tts-eng --local-dir models/mms-tts-eng
 
 docker compose -f compose.yaml -f compose.cuda.yaml up --build -d
 ```
